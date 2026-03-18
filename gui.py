@@ -20,6 +20,62 @@ from smith_chart    import SmithCanvas
 from export_utils   import export_csv
 
 
+# ─── Unit-aware input widget ──────────────────────────────────────────────────
+
+class UnitField(QWidget):
+    """A QLineEdit + QComboBox pair that returns a value in SI base units."""
+
+    FREQ_UNITS = [("Hz", 1e0), ("kHz", 1e3), ("MHz", 1e6), ("GHz", 1e9)]
+    IND_UNITS  = [("nH", 1e-9), ("µH", 1e-6), ("mH", 1e-3), ("H", 1e0)]
+    CAP_UNITS  = [("pF", 1e-12), ("nF", 1e-9), ("µF", 1e-6), ("F", 1e0)]
+
+    def __init__(self, units: list, default_value: str, default_unit: str,
+                 tip: str = "", parent=None):
+        super().__init__(parent)
+        self._units = units
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(3)
+
+        self._edit = QLineEdit(default_value)
+        self._edit.setToolTip(tip)
+        self._edit.setFixedHeight(26)
+
+        self._combo = QComboBox()
+        self._combo.setFixedHeight(26)
+        self._combo.setFixedWidth(54)
+        for label, _ in units:
+            self._combo.addItem(label)
+        idx = next((i for i, (lbl, _) in enumerate(units) if lbl == default_unit), 0)
+        self._combo.setCurrentIndex(idx)
+
+        layout.addWidget(self._edit)
+        layout.addWidget(self._combo)
+
+    def si_value(self) -> float:
+        """Return the numeric value converted to SI base units."""
+        raw = float(self._edit.text())
+        _, mult = self._units[self._combo.currentIndex()]
+        return raw * mult
+
+    def set_si_value(self, si_val: float):
+        """Set the field from an SI value, auto-selecting the most readable unit."""
+        best_idx = 0
+        for i, (_, mult) in enumerate(self._units):
+            disp = abs(si_val / mult)
+            if 0.1 <= disp < 10000:
+                best_idx = i
+                break
+            if disp >= 0.1:
+                best_idx = i
+        _, mult = self._units[best_idx]
+        self._combo.setCurrentIndex(best_idx)
+        self._edit.setText(f"{si_val / mult:.6g}")
+
+    def text(self) -> str:
+        return self._edit.text()
+
+
 # ─── Background worker ────────────────────────────────────────────────────────
 
 class SimWorker(QThread):
@@ -160,25 +216,27 @@ class MainWindow(QMainWindow):
         gb_sw = QGroupBox("Frequency Sweep")
         form_sw = QFormLayout(gb_sw)
         form_sw.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        self.inp_f_start  = _field("1e6",  "Start frequency in Hz (e.g. 1e6 = 1 MHz)")
-        self.inp_f_stop   = _field("1e9",  "Stop frequency in Hz")
-        self.inp_n_points = _field("500",  "Number of sweep points (10–2000)")
-        form_sw.addRow("Start (Hz):", self.inp_f_start)
-        form_sw.addRow("Stop (Hz):",  self.inp_f_stop)
-        form_sw.addRow("Points:",     self.inp_n_points)
+        self.inp_f_start  = UnitField(UnitField.FREQ_UNITS, "1", "MHz",
+                                      "Start frequency")
+        self.inp_f_stop   = UnitField(UnitField.FREQ_UNITS, "1", "GHz",
+                                      "Stop frequency")
+        self.inp_n_points = _field("500", "Number of sweep points (10–2000)")
+        form_sw.addRow("Start:",  self.inp_f_start)
+        form_sw.addRow("Stop:",   self.inp_f_stop)
+        form_sw.addRow("Points:", self.inp_n_points)
         v.addWidget(gb_sw)
 
         # RLC
         gb_rlc = QGroupBox("Antenna Impedance (RLC Model)")
         form_rlc = QFormLayout(gb_rlc)
         form_rlc.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        self.inp_R  = _field("73",    "Resistance Ω")
-        self.inp_L  = _field("35e-9", "Inductance H")
-        self.inp_C  = _field("7e-12", "Capacitance F")
-        self.inp_Z0 = _field("50",    "Transmission line impedance Ω")
+        self.inp_R  = _field("73", "Resistance Ω")
+        self.inp_L  = UnitField(UnitField.IND_UNITS, "35", "nH", "Inductance")
+        self.inp_C  = UnitField(UnitField.CAP_UNITS, "7",  "pF", "Capacitance")
+        self.inp_Z0 = _field("50", "Transmission line impedance Ω")
         form_rlc.addRow("R (Ω):",  self.inp_R)
-        form_rlc.addRow("L (H):",  self.inp_L)
-        form_rlc.addRow("C (F):",  self.inp_C)
+        form_rlc.addRow("L:",      self.inp_L)
+        form_rlc.addRow("C:",      self.inp_C)
         form_rlc.addRow("Z₀ (Ω):", self.inp_Z0)
         v.addWidget(gb_rlc)
 
@@ -299,10 +357,10 @@ class MainWindow(QMainWindow):
             self.lbl_preset_note.setText("")
             return
         self.inp_R.setText(str(p["R"]))
-        self.inp_L.setText(str(p["L"]))
-        self.inp_C.setText(str(p["C"]))
-        self.inp_f_start.setText(str(p["f_start"]))
-        self.inp_f_stop.setText(str(p["f_stop"]))
+        self.inp_L.set_si_value(p["L"])
+        self.inp_C.set_si_value(p["C"])
+        self.inp_f_start.set_si_value(p["f_start"])
+        self.inp_f_stop.set_si_value(p["f_stop"])
         self.lbl_preset_note.setText(p.get("note", ""))
 
     def _on_mode_change(self, mode: str):
@@ -423,7 +481,8 @@ class MainWindow(QMainWindow):
     def _parse_inputs(self) -> dict:
         def pf(field, name, positive=True):
             try:
-                v = float(field.text())
+                # UnitField exposes si_value(); plain QLineEdit uses float(text)
+                v = field.si_value() if isinstance(field, UnitField) else float(field.text())
             except ValueError:
                 raise ValueError(f"'{name}' must be a valid number.")
             if positive and v <= 0:
