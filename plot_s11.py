@@ -51,7 +51,7 @@ PLOT_MODES = [
 Y_LIMITS = {
     "Log Mag (dB)":      (-40.0,  0.0),
     "Linear Mag":        (0.0,    1.0),
-    "VSWR":              (1.0,  100.0),
+    "VSWR":              (1.0,   50.0),
     "Phase (deg)":       (-180.0, 180.0),
     "Unwrapped Phase":   None,   # auto — can span many cycles
     "Group Delay (ns)":  None,   # auto
@@ -222,7 +222,7 @@ class VNACanvas(FigureCanvas):
         col = self._TRACE_COLORS.get(mode, "#58a6ff")
         if mode == "Log Mag (dB)":       return result["s11_db"],          "S11 (dB)",        col
         if mode == "Linear Mag":          return np.abs(result["gamma"]),   "|Γ|",             col
-        if mode == "VSWR":                return result["vswr"],             "VSWR",            col
+        if mode == "VSWR":                return np.minimum(result["vswr"], 50.0), "VSWR",            col
         if mode == "Phase (deg)":         return result["phase_deg"],        "Phase (°)",       col
         if mode == "Unwrapped Phase":     return result["phase_unwrapped"],  "Phase (°)",       col
         if mode == "Group Delay (ns)":    return result["group_delay_ns"],   "Group Delay (ns)",col

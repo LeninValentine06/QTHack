@@ -31,12 +31,19 @@ from PyQt6.QtWidgets import (
     QFormLayout, QLineEdit, QPushButton, QLabel, QComboBox,
     QGroupBox, QFileDialog, QSplitter, QMessageBox, QFrame,
     QTableWidget, QTableWidgetItem, QHeaderView,
-    QSizePolicy, QCheckBox, QScrollArea,
+    QSizePolicy, QCheckBox, QScrollArea, QTabWidget,
+    QGraphicsScene, QGraphicsView, QGraphicsItem,
+    QGraphicsRectItem, QGraphicsLineItem, QGraphicsTextItem,
+    QGraphicsPathItem,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QBrush
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QRectF, QPointF, QSizeF
+from PyQt6.QtGui import (
+    QAction, QColor, QBrush, QPen, QPainter, QPainterPath,
+    QFont, QFontMetrics,
+)
 
 from rf_engine      import run_simulation
+from network_engine import compute_network_response   # validation backend
 from antenna_models import PRESETS
 from plot_s11       import VNACanvas, PLOT_MODES, _fmt_freq
 from smith_chart    import SmithCanvas
@@ -324,6 +331,664 @@ class ReadoutCard(QWidget):
             self._vals[key].setText(text)
 
 
+# ─── Schematic Editor ──────────────────────────────────────────────────────────
+#
+# Textbook two-rail schematic.
+#
+# Geometry:
+#
+#   PORT ○──────┬──────┬──────┬──────○ OUT
+#               │      │      │
+#              [L]    [C]    [R]          ← vertical shunt elements
+#               │      │      │
+#   GND  ───────┴──────┴──────┴──────
+#
+#   R, L, C  → drawn as vertical shunt elements between rails
+#   RLC      → L in series on top rail, shunt C, R in series — proper ladder
+#
+# Each component item is positioned at its column X, vertically spanning
+# exactly from RAIL_TOP to RAIL_BOT.  The top rail and bottom rail are
+# static background lines drawn by the scene.
+
+# ── Geometry ─────────────────────────────────────────────────────────────────
+_TOP_Y    = -80     # Y of top (signal) rail in scene coords
+_BOT_Y    =  80     # Y of bottom (ground) rail in scene coords
+_H        = _BOT_Y - _TOP_Y          # 160 px  — vertical span
+_PITCH    = 120     # horizontal pitch between component columns
+_PORT_X   =  80     # X of left port terminal
+_SIG_C    = "#58a6ff"   # signal rail / component colour (blue)
+_GND_C    = "#8b949e"   # ground rail colour (grey)
+_LOAD_C   = "#d29922"   # amber for the terminal load
+_LBL_C    = "#8b949e"   # value/type label colour
+
+def _qc(h): return QColor(h)
+def _wp(c, w=2.0): return QPen(_qc(c), w)
+
+
+# ── Helper drawing functions (pure, no class state) ──────────────────────────
+
+def _draw_inductor_series(painter, x0, x1, y):
+    """
+    Series inductor: draw coil bumps inline on a horizontal wire at height y.
+    x0..x1 = full width allocated (including stubs).
+    """
+    coil_w = (x1 - x0) * 0.60
+    cx     = (x0 + x1) / 2
+    n_b    = 4
+    bw     = coil_w / n_b
+    lx     = cx - coil_w / 2
+    # stub in
+    painter.drawLine(QPointF(x0, y), QPointF(lx, y))
+    path = QPainterPath()
+    path.moveTo(lx, y)
+    for i in range(n_b):
+        path.arcTo(QRectF(lx + i*bw, y - bw, bw, bw), 0, 180)
+    painter.drawPath(path)
+    # stub out
+    painter.drawLine(QPointF(lx + coil_w, y), QPointF(x1, y))
+
+
+def _draw_resistor_series(painter, x0, x1, y):
+    """Series resistor zigzag inline on a horizontal wire at height y."""
+    zw   = (x1 - x0) * 0.55
+    cx   = (x0 + x1) / 2
+    n, a = 7, 8
+    seg  = zw / n
+    lx   = cx - zw / 2
+    painter.drawLine(QPointF(x0, y), QPointF(lx, y))
+    path = QPainterPath()
+    path.moveTo(lx, y)
+    for i in range(n):
+        path.lineTo(lx + (i+0.5)*seg, y - a if i%2==0 else y + a)
+        path.lineTo(lx + (i+1)*seg,   y)
+    painter.drawPath(path)
+    painter.drawLine(QPointF(lx + zw, y), QPointF(x1, y))
+
+
+def _draw_capacitor_shunt(painter, cx, top_y, bot_y, sig_col, gnd_col):
+    """
+    Shunt capacitor: two horizontal plates between top and bottom rails.
+    cx = column centre x.
+    """
+    mid  = (top_y + bot_y) / 2
+    gap  = 10
+    pw   = 34   # plate width
+    # Wire from top rail down to top plate
+    painter.setPen(_wp(sig_col))
+    painter.drawLine(QPointF(cx, top_y), QPointF(cx, mid - gap/2))
+    # Top plate
+    painter.drawLine(QPointF(cx - pw/2, mid - gap/2),
+                     QPointF(cx + pw/2, mid - gap/2))
+    # Bottom plate
+    painter.drawLine(QPointF(cx - pw/2, mid + gap/2),
+                     QPointF(cx + pw/2, mid + gap/2))
+    # Wire from bottom plate to bottom rail
+    painter.setPen(_wp(gnd_col))
+    painter.drawLine(QPointF(cx, mid + gap/2), QPointF(cx, bot_y))
+
+
+def _draw_inductor_shunt(painter, cx, top_y, bot_y, col):
+    """
+    Shunt inductor: vertical coil between rails.
+    """
+    h    = bot_y - top_y
+    n_b  = 4
+    bh   = h * 0.55 / n_b
+    cy0  = top_y + (h - n_b * bh) / 2
+    painter.setPen(_wp(col))
+    painter.drawLine(QPointF(cx, top_y), QPointF(cx, cy0))
+    path = QPainterPath()
+    path.moveTo(cx, cy0)
+    for i in range(n_b):
+        ty = cy0 + i * bh
+        path.arcTo(QRectF(cx - bh/2, ty, bh, bh), 90, 180)
+    painter.drawPath(path)
+    yl = cy0 + n_b * bh
+    painter.drawLine(QPointF(cx, yl), QPointF(cx, bot_y))
+
+
+def _draw_resistor_shunt(painter, cx, top_y, bot_y, col):
+    """
+    Shunt resistor: IEC rectangle between rails.
+    """
+    h   = bot_y - top_y
+    bh  = h * 0.44
+    bw  = 20
+    mcy = (top_y + bot_y) / 2
+    painter.setPen(_wp(col))
+    painter.drawLine(QPointF(cx, top_y), QPointF(cx, mcy - bh/2))
+    painter.drawRect(QRectF(cx - bw/2, mcy - bh/2, bw, bh))
+    painter.drawLine(QPointF(cx, mcy + bh/2), QPointF(cx, bot_y))
+
+
+# ── Component item ────────────────────────────────────────────────────────────
+
+class SchematicComponent(QGraphicsItem):
+    """
+    One component column.  Item origin is at (column_x, _TOP_Y).
+    The item spans vertically from 0 (top rail) to _H (bottom rail).
+
+    Component drawing rules:
+      R   → shunt resistor (IEC rectangle, vertical)
+      L   → shunt inductor (vertical coil)
+      C   → shunt capacitor (two horizontal plates)
+      RLC → series L on top rail + shunt C + series R on top rail
+            (the classic pi/T ladder section for a series-RLC antenna)
+    """
+
+    def __init__(self, comp_type, values, scene_ref, parent=None):
+        super().__init__(parent)
+        self.comp_type  = comp_type
+        self.values     = dict(values)
+        self._scene_ref = scene_ref
+        self._is_load   = False
+        self._hovered   = False
+        self.setFlags(
+            QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
+            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+            QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges,
+        )
+        self.setAcceptHoverEvents(True)
+
+    def boundingRect(self):
+        # Extra vertical space for labels above and below
+        return QRectF(-_PITCH/2, -28, _PITCH, _H + 56)
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        is_load = self._is_load
+        hover   = self._hovered or self.isSelected()
+        sig_c   = _LOAD_C if is_load else (_SIG_C if not hover else "#89c4ff")
+        gnd_c   = _GND_C
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        t = self.comp_type
+
+        if t == "R":
+            _draw_resistor_shunt(painter, 0, 0, _H, sig_c)
+        elif t == "L":
+            _draw_inductor_shunt(painter, 0, 0, _H, sig_c)
+        elif t == "C":
+            _draw_capacitor_shunt(painter, 0, 0, _H, sig_c, gnd_c)
+        elif t == "RLC":
+            self._paint_rlc_series(painter, sig_c, gnd_c)
+
+        # ── Value label — above the top rail ─────────────────────────────────
+        painter.setPen(QPen(_qc(sig_c if is_load else _LBL_C), 1))
+        painter.setFont(QFont("Consolas", 8))
+        painter.drawText(
+            QRectF(-_PITCH/2, -26, _PITCH, 14),
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
+            self._value_str(),
+        )
+
+        # ── Type label — below the bottom rail ───────────────────────────────
+        painter.setPen(QPen(_qc(sig_c), 1))
+        painter.setFont(QFont("Consolas", 7))
+        painter.drawText(
+            QRectF(-_PITCH/2, _H + 6, _PITCH, 14),
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+            self.comp_type + (" [LOAD]" if is_load else ""),
+        )
+
+    def _paint_rlc_series(self, painter, sig_c, gnd_c):
+        """
+        Textbook series-RLC section drawn in one column:
+
+          ├──coil──●──zigzag──┤   (top rail, series L then series R)
+                   │
+                  [C]              (shunt C from the node between L and R)
+                   │
+          ├────────────────────┤   (bottom rail)
+
+        The junction node is at x=0 (column centre), y=0 (top rail).
+        """
+        # ── Series L (left half of top rail) ─────────────────────────────────
+        painter.setPen(_wp(sig_c))
+        _draw_inductor_series(painter, -_PITCH/2, -8, 0)
+
+        # ── Junction dot ─────────────────────────────────────────────────────
+        painter.setBrush(QBrush(_qc(sig_c)))
+        painter.setPen(QPen(_qc(sig_c), 1))
+        painter.drawEllipse(QPointF(0, 0), 4, 4)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        # ── Shunt C (vertical, from junction down to bottom rail) ─────────────
+        _draw_capacitor_shunt(painter, 0, 0, _H, sig_c, gnd_c)
+
+        # ── Series R (right half of top rail) ────────────────────────────────
+        painter.setPen(_wp(sig_c))
+        _draw_resistor_series(painter, 8, _PITCH/2, 0)
+
+    def _value_str(self):
+        t, v = self.comp_type, self.values
+        def _f(val, u, s, d=1): return f"{val/s:.{d}f} {u}"
+        if t == "R":  return _f(v.get("R", 0), "Ω",   1,    1)
+        if t == "L":
+            l = v.get("L", 0)
+            return _f(l, "nH", 1e-9, 1) if l < 1e-6 else _f(l, "µH", 1e-6, 2)
+        if t == "C":
+            c = v.get("C", 0)
+            return _f(c, "pF", 1e-12, 1) if c < 1e-9 else _f(c, "nF", 1e-9, 2)
+        if t == "RLC":
+            v2 = self.values
+            return (f"L={v2.get('L',0)*1e9:.0f}nH  "
+                    f"C={v2.get('C',0)*1e12:.0f}pF  "
+                    f"R={v2.get('R',0):.0f}Ω")
+        return ""
+
+    # ── Interaction ───────────────────────────────────────────────────────────
+
+    def hoverEnterEvent(self, e):
+        self._hovered = True;  self.update(); super().hoverEnterEvent(e)
+
+    def hoverLeaveEvent(self, e):
+        self._hovered = False; self.update(); super().hoverLeaveEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        self._scene_ref.request_edit(self)
+        super().mouseDoubleClickEvent(e)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
+            return QPointF(value.x(), _TOP_Y)   # lock to top rail
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            self._scene_ref.on_component_moved()
+        return super().itemChange(change, value)
+
+    def to_config_dict(self):
+        t, v = self.comp_type, self.values
+        if t == "R":   return {"type":"R",   "value": float(v.get("R",50))}
+        if t == "L":   return {"type":"L",   "value": float(v.get("L",1e-6))}
+        if t == "C":   return {"type":"C",   "value": float(v.get("C",1e-9))}
+        if t == "RLC": return {"type":"RLC",
+                               "R": float(v.get("R",50)),
+                               "L": float(v.get("L",1e-6)),
+                               "C": float(v.get("C",1e-9))}
+        return {}
+
+
+# ── Scene ─────────────────────────────────────────────────────────────────────
+
+class SchematicScene(QGraphicsScene):
+    config_changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._components = []
+        self._static     = []   # static background items (rails, labels)
+        self.setSceneRect(-100, -120, 2400, 320)
+
+    # ── Component management ──────────────────────────────────────────────────
+
+    def add_component(self, comp_type, values=None):
+        defs = {
+            "R":   {"R": 50.0},
+            "L":   {"L": 35e-9},
+            "C":   {"C": 7e-12},
+            "RLC": {"R": 73.0, "L": 35e-9, "C": 7e-12},
+        }
+        comp = SchematicComponent(comp_type,
+                                  values if values else defs.get(comp_type, {}),
+                                  self)
+        self.addItem(comp)
+        self._components.append(comp)
+        self._layout()
+        self.config_changed.emit()
+
+    def remove_selected(self):
+        for c in [c for c in self._components if c.isSelected()]:
+            self._components.remove(c)
+            self.removeItem(c)
+        self._layout()
+        self.config_changed.emit()
+
+    def clear_all(self):
+        for c in list(self._components):
+            self.removeItem(c)
+        self._components.clear()
+        self._redraw_static()
+        self.config_changed.emit()
+
+    def request_edit(self, comp):
+        dlg = _ValueDialog(comp.comp_type, comp.values)
+        if dlg.exec():
+            comp.values = dlg.get_values()
+            comp.update()
+            self.config_changed.emit()
+
+    def on_component_moved(self):
+        self._components.sort(key=lambda c: c.x())
+        self._redraw_static()
+        self._mark_load()
+        self.config_changed.emit()
+
+    def _layout(self):
+        x = _PORT_X + _PITCH / 2
+        for comp in self._components:
+            comp.setPos(x, _TOP_Y)
+            x += _PITCH
+        self._redraw_static()
+        self._mark_load()
+
+    def _mark_load(self):
+        n = len(self._components)
+        for i, c in enumerate(self._components):
+            c._is_load = (i == n - 1)
+            c.update()
+
+    # ── Static background (rails + terminals) ─────────────────────────────────
+
+    def _redraw_static(self):
+        for item in self._static:
+            self.removeItem(item)
+        self._static.clear()
+
+        # Draw empty placeholder when no components
+        if not self._components:
+            ph = self.addText(
+                "Add components using the buttons above",
+                QFont("Consolas", 10))
+            ph.setDefaultTextColor(_qc(_GND_C))
+            ph.setPos(40, _TOP_Y + _H/2 - 10)
+            self._static.append(ph)
+            return
+
+        first_x = self._components[0].x()
+        last_x  = self._components[-1].x()
+        left_x  = first_x - _PITCH / 2
+        right_x = last_x  + _PITCH / 2
+
+        sp = QPen(_qc(_SIG_C), 2.2)
+        gp = QPen(_qc(_GND_C), 2.2)
+        tp = QPen(_qc("#3fb950"), 2.0)   # terminal green
+
+        def add(item):
+            self._static.append(item)
+            return item
+
+        # ── Top rail ──────────────────────────────────────────────────────────
+        add(self.addLine(left_x, _TOP_Y, right_x, _TOP_Y, sp))
+
+        # ── Bottom rail ───────────────────────────────────────────────────────
+        add(self.addLine(left_x, _TOP_Y + _H, right_x, _TOP_Y + _H, gp))
+
+        # ── Left vertical (port side) ─────────────────────────────────────────
+        add(self.addLine(left_x, _TOP_Y, left_x, _TOP_Y + _H, gp))
+
+        # ── Right vertical (output side) ──────────────────────────────────────
+        add(self.addLine(right_x, _TOP_Y, right_x, _TOP_Y + _H, gp))
+
+        # ── PORT terminal ─────────────────────────────────────────────────────
+        # Circle on top-left corner
+        px, py = left_x, _TOP_Y
+        add(self.addEllipse(px-6, py-6, 12, 12, tp,
+                            QBrush(Qt.BrushStyle.NoBrush)))
+        lbl = self.addText("PORT", QFont("Consolas", 9))
+        lbl.setDefaultTextColor(_qc("#3fb950"))
+        lbl.setPos(px - 40, py - 22)
+        add(lbl)
+
+        # ── OUT terminal ──────────────────────────────────────────────────────
+        ox, oy = right_x, _TOP_Y
+        add(self.addEllipse(ox-6, oy-6, 12, 12, tp,
+                            QBrush(Qt.BrushStyle.NoBrush)))
+        olbl = self.addText("OUT", QFont("Consolas", 9))
+        olbl.setDefaultTextColor(_qc("#3fb950"))
+        olbl.setPos(ox + 10, oy - 22)
+        add(olbl)
+
+        # ── Ground symbol (below bottom-right corner) ─────────────────────────
+        gx = right_x
+        gy = _TOP_Y + _H
+        for i, hw in enumerate([14, 10, 6]):
+            yi = gy + 6 + i * 6
+            add(self.addLine(gx - hw, yi, gx + hw, yi, gp))
+
+        # ── Node dots where each component meets the top rail ─────────────────
+        dot_pen  = QPen(_qc(_SIG_C), 1)
+        dot_brush = QBrush(_qc(_SIG_C))
+        for comp in self._components:
+            cx = comp.x()
+            add(self.addEllipse(cx-5, _TOP_Y-5, 10, 10, dot_pen, dot_brush))
+
+        # ── Node dots on bottom rail ───────────────────────────────────────────
+        dot_gpen  = QPen(_qc(_GND_C), 1)
+        dot_gbrush = QBrush(_qc(_GND_C))
+        for comp in self._components:
+            cx = comp.x()
+            add(self.addEllipse(cx-5, _TOP_Y+_H-5, 10, 10,
+                                dot_gpen, dot_gbrush))
+
+    def get_config(self):
+        return [c.to_config_dict() for c in self._components]
+
+
+
+class _ValueDialog(QWidget):
+    """
+    Minimal modal dialog for editing component values.
+    Uses QWidget + exec() via a local event loop.
+    """
+
+    def __init__(self, comp_type: str, current_values: dict):
+        super().__init__(None,
+            Qt.WindowType.Dialog |
+            Qt.WindowType.WindowTitleHint |
+            Qt.WindowType.WindowCloseButtonHint)
+        self.setWindowTitle(f"Edit  {comp_type}")
+        self.setFixedWidth(260)
+        self.setStyleSheet(
+            f"background:{BG1};color:{TEXT1};"
+            f"font-family:{MONO};font-size:10px;")
+        self._accepted = False
+        self._fields   = {}
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(8)
+        lay.setContentsMargins(14, 14, 14, 14)
+
+        specs = {
+            "R":   [("R (Ω)",  "R",  current_values.get("R",  50.0),  1,    "Ω")],
+            "L":   [("L (nH)", "L",  current_values.get("L",  35e-9) * 1e9, 1e-9, "nH")],
+            "C":   [("C (pF)", "C",  current_values.get("C",  7e-12) * 1e12, 1e-12, "pF")],
+            "RLC": [
+                ("R (Ω)",  "R", current_values.get("R",  73.0),  1,    "Ω"),
+                ("L (nH)", "L", current_values.get("L",  35e-9) * 1e9, 1e-9, "nH"),
+                ("C (pF)", "C", current_values.get("C",  7e-12) * 1e12, 1e-12, "pF"),
+            ],
+        }
+
+        for label, key, val, scale, unit in specs.get(comp_type, []):
+            row = QHBoxLayout()
+            lbl = QLabel(label)
+            lbl.setFixedWidth(65)
+            lbl.setStyleSheet(f"color:{TEXT2};")
+            fld = QLineEdit(f"{val:.6g}")
+            fld.setStyleSheet(
+                f"background:{BG0};border:1px solid {BORD2};"
+                f"color:{TEXT1};padding:2px 4px;border-radius:2px;")
+            self._fields[key] = (fld, scale)
+            row.addWidget(lbl)
+            row.addWidget(fld)
+            lay.addLayout(row)
+
+        btn_row = QHBoxLayout()
+        ok_btn  = QPushButton("OK")
+        ok_btn.setStyleSheet(
+            f"background:{C_GREEN2};border:1px solid {C_GREEN};"
+            f"color:{C_GREEN};padding:4px 16px;border-radius:3px;"
+            f"font-weight:bold;")
+        ok_btn.clicked.connect(self._on_ok)
+        btn_row.addStretch()
+        btn_row.addWidget(ok_btn)
+        lay.addLayout(btn_row)
+
+        self._loop = None
+
+    def exec(self) -> bool:
+        from PyQt6.QtCore import QEventLoop
+        self._loop = QEventLoop()
+        self.show()
+        self._loop.exec()
+        return self._accepted
+
+    def _on_ok(self):
+        self._accepted = True
+        if self._loop:
+            self._loop.quit()
+        self.close()
+
+    def get_values(self) -> dict:
+        result = {}
+        for key, (fld, scale) in self._fields.items():
+            try:
+                result[key] = float(fld.text()) * scale
+            except ValueError:
+                pass
+        return result
+
+    def closeEvent(self, event):
+        if self._loop and self._loop.isRunning():
+            self._loop.quit()
+        super().closeEvent(event)
+
+
+# ── Schematic editor widget (canvas + palette toolbar) ────────────────────────
+
+class SchematicEditorWidget(QWidget):
+    """
+    The full editor: palette buttons on top, schematic canvas below.
+    Lives in the "Network" tab of the sidebar tab widget.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # ── Palette bar ───────────────────────────────────────────────────────
+        palette = QWidget()
+        palette.setFixedHeight(30)
+        palette.setStyleSheet(f"background:{BG0};border-bottom:1px solid {BORD2};")
+        pal_lay = QHBoxLayout(palette)
+        pal_lay.setContentsMargins(6, 3, 6, 3)
+        pal_lay.setSpacing(4)
+
+        self._scene = SchematicScene()
+
+        for label, ctype in [
+            ("＋R", "R"), ("＋L", "L"), ("＋C", "C"), ("＋RLC", "RLC"),
+        ]:
+            btn = QPushButton(label)
+            btn.setFixedHeight(22)
+            btn.setStyleSheet(
+                f"font-size:9px;padding:0 6px;"
+                f"background:{BG2};border:1px solid {BORD2};"
+                f"color:{TEXT2};font-family:{MONO};border-radius:2px;")
+            btn.clicked.connect(lambda _, t=ctype: self._scene.add_component(t))
+            pal_lay.addWidget(btn)
+
+        pal_lay.addSpacing(8)
+
+        del_btn = QPushButton("✕ Del")
+        del_btn.setFixedHeight(22)
+        del_btn.setStyleSheet(
+            f"font-size:9px;padding:0 6px;"
+            f"background:{BG2};border:1px solid {RED};"
+            f"color:{RED};font-family:{MONO};border-radius:2px;")
+        del_btn.clicked.connect(self._scene.remove_selected)
+        pal_lay.addWidget(del_btn)
+
+        clr_btn = QPushButton("↺ Clear")
+        clr_btn.setFixedHeight(22)
+        clr_btn.setStyleSheet(
+            f"font-size:9px;padding:0 6px;"
+            f"background:{BG2};border:1px solid {BORD2};"
+            f"color:{TEXT3};font-family:{MONO};border-radius:2px;")
+        clr_btn.clicked.connect(self._scene.clear_all)
+        pal_lay.addWidget(clr_btn)
+        pal_lay.addStretch()
+
+        # Hint label
+        hint = QLabel("double-click to edit · drag to reorder")
+        hint.setStyleSheet(
+            f"color:{TEXT3};font-size:8px;background:transparent;"
+            f"font-family:{MONO};")
+        pal_lay.addWidget(hint)
+
+        outer.addWidget(palette)
+
+        # ── Canvas ────────────────────────────────────────────────────────────
+        self._view = QGraphicsView(self._scene)
+        self._view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self._view.setStyleSheet(
+            f"background:{BG1};border:none;")
+        self._view.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._view.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._view.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        outer.addWidget(self._view)
+
+        # ── Z0 row ────────────────────────────────────────────────────────────
+        z0_bar = QWidget()
+        z0_bar.setFixedHeight(28)
+        z0_bar.setStyleSheet(
+            f"background:{BG0};border-top:1px solid {BORD2};")
+        z0_lay = QHBoxLayout(z0_bar)
+        z0_lay.setContentsMargins(8, 4, 8, 4)
+        z0_lay.setSpacing(6)
+        lbl = QLabel("Z₀ (Ω)")
+        lbl.setStyleSheet(
+            f"color:{TEXT3};font-size:9px;background:transparent;"
+            f"font-family:{MONO};")
+        self.inp_Z0 = QLineEdit("50")
+        self.inp_Z0.setFixedWidth(55)
+        self.inp_Z0.setFixedHeight(20)
+        self.inp_Z0.setStyleSheet(
+            f"background:{BG0};border:1px solid {BORD2};"
+            f"color:{TEXT1};font-size:9px;padding:0 4px;"
+            f"font-family:{MONO};border-radius:2px;")
+        z0_lay.addWidget(lbl)
+        z0_lay.addWidget(self.inp_Z0)
+        z0_lay.addStretch()
+        outer.addWidget(z0_bar)
+
+        # Seed with default RLC load
+        self._scene.add_component("RLC")
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def get_config(self) -> list:
+        return self._scene.get_config()
+
+    def get_Z0(self) -> float:
+        try:
+            return float(self.inp_Z0.text())
+        except ValueError:
+            return 50.0
+
+    def load_preset(self, R: float, L: float, C: float):
+        """Replace the last (load) component with preset RLC values."""
+        comps = self._scene._components
+        if comps:
+            last = comps[-1]
+            if last.comp_type == "RLC":
+                last.values = {"R": R, "L": L, "C": C}
+                last.update()
+                self._scene.config_changed.emit()
+            else:
+                # Add a fresh RLC at the end
+                self._scene.add_component("RLC", {"R": R, "L": L, "C": C})
+        else:
+            self._scene.add_component("RLC", {"R": R, "L": L, "C": C})
+
 # ─── Background worker ─────────────────────────────────────────────────────────
 
 class SimWorker(QThread):
@@ -336,7 +1001,22 @@ class SimWorker(QThread):
 
     def run(self):
         try:
-            self.finished.emit(run_simulation(**self.params))
+            p      = self.params
+            config = p.pop("network_config", None)
+            sweep  = p.get("sweep_type", "log")
+            if config is not None:
+                freqs = (np.linspace(p["f_start"], p["f_stop"], p["n_points"])
+                         if sweep == "linear" else
+                         np.logspace(np.log10(p["f_start"]),
+                                     np.log10(p["f_stop"]), p["n_points"]))
+                result = compute_network_response(config, freqs,
+                                                  Z0=p["Z0"], mode="skrf")
+                result["sweep_type"]       = sweep
+                result["if_bw_hz"]         = p.get("if_bw", 1000.0)
+                result["output_power_dbm"] = p.get("output_power_dbm", -10.0)
+                self.finished.emit(result)
+            else:
+                self.finished.emit(run_simulation(**p))
         except Exception as e:
             self.error.emit(str(e))
 
@@ -408,7 +1088,30 @@ class MainWindow(QMainWindow):
         rv.setContentsMargins(0, 0, 0, 0)
         rv.setSpacing(0)
 
-        # Horizontal root: sidebar | content
+        # ── Top-level tab widget ──────────────────────────────────────────────
+        # Tab 1: VNA Plots (sidebar + CH1/CH2/Smith/Readout)
+        # Tab 2: Network Editor (full-width schematic canvas)
+        self._main_tabs = QTabWidget()
+        self._main_tabs.setStyleSheet(
+            f"QTabWidget::pane{{background:{BG0};border:none;}}"
+            f"QTabBar::tab{{background:{BG0};color:{TEXT3};"
+            f"padding:5px 18px;font-size:10px;font-family:{MONO};"
+            f"border:none;border-bottom:2px solid transparent;"
+            f"letter-spacing:1px;}}"
+            f"QTabBar::tab:selected{{color:{TEXT1};"
+            f"border-bottom:2px solid {C_BLUE};"
+            f"background:{BG1};}}"
+            f"QTabBar::tab:hover{{color:{TEXT2};background:{BG1};}}"
+            f"QTabBar{{background:{BG0};"
+            f"border-bottom:1px solid {BORD2};}}"
+        )
+
+        # ── Tab 1: VNA Plots ──────────────────────────────────────────────────
+        plots_widget = QWidget()
+        plots_lay = QVBoxLayout(plots_widget)
+        plots_lay.setContentsMargins(0, 0, 0, 0)
+        plots_lay.setSpacing(0)
+
         h_split = QSplitter(Qt.Orientation.Horizontal)
         h_split.setHandleWidth(2)
         h_split.addWidget(self._build_sidebar())
@@ -416,8 +1119,21 @@ class MainWindow(QMainWindow):
         h_split.setSizes([200, 1240])
         h_split.setStretchFactor(0, 0)
         h_split.setStretchFactor(1, 1)
+        plots_lay.addWidget(h_split)
 
-        rv.addWidget(h_split, stretch=1)
+        self._main_tabs.addTab(plots_widget, "VNA Plots")
+
+        # ── Tab 2: Network Editor ─────────────────────────────────────────────
+        net_widget = QWidget()
+        net_widget.setStyleSheet(f"background:{BG0};")
+        net_lay = QVBoxLayout(net_widget)
+        net_lay.setContentsMargins(0, 0, 0, 0)
+        net_lay.setSpacing(0)
+        self.schematic_editor = SchematicEditorWidget()
+        net_lay.addWidget(self.schematic_editor)
+        self._main_tabs.addTab(net_widget, "Network Editor")
+
+        rv.addWidget(self._main_tabs, stretch=1)
         rv.addWidget(self._build_marker_status_bar())
         rv.addWidget(self._build_marker_table_widget())
 
@@ -455,13 +1171,12 @@ class MainWindow(QMainWindow):
         tl.addStretch()
         v.addWidget(title_w)
 
-        # Scrollable parameter groups
+        # Scrollable parameter groups (sweep + preset only)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setStyleSheet(f"background:{BG0};border:none;")
-
         content = QWidget()
         content.setStyleSheet(f"background:{BG0};")
         cv = QVBoxLayout(content)
@@ -905,12 +1620,15 @@ class MainWindow(QMainWindow):
         if p is None:
             self.lbl_preset_note.setText("")
             return
-        self.inp_R.setText(str(p["R"]))
-        self.inp_L.set_si_value(p["L"])
-        self.inp_C.set_si_value(p["C"])
         self.inp_f_start.set_si_value(p["f_start"])
         self.inp_f_stop.set_si_value(p["f_stop"])
         self.lbl_preset_note.setText(p.get("note", ""))
+        # Also seed the hidden RLC fields (used as defaults if user hasn't
+        # touched the network tab yet) and push values into the schematic
+        self.inp_R.setText(str(p["R"]))
+        self.inp_L.set_si_value(p["L"])
+        self.inp_C.set_si_value(p["C"])
+        self.schematic_editor.load_preset(p["R"], p["L"], p["C"])
 
     def _set_secondary_mode(self, mode):
         self.mode_combo.blockSignals(True)
@@ -1215,15 +1933,21 @@ class MainWindow(QMainWindow):
             n_pts = int(self.inp_n_pts.text())
         except ValueError:
             raise ValueError("'Sweep Points' must be a whole number.")
-        R  = pf(self.inp_R,  "Resistance", positive=False)
-        L  = pf(self.inp_L,  "Inductance")
-        C  = pf(self.inp_C,  "Capacitance")
-        Z0 = pf(self.inp_Z0, "Z0")
 
         if f_stop <= f_start:
             raise ValueError("Stop frequency must be > Start frequency.")
         if not (10 <= n_pts <= 2000):
             raise ValueError("Sweep Points must be 10–2000.")
+
+        # Z0 from schematic editor
+        Z0 = self.schematic_editor.get_Z0()
+        if Z0 <= 0:
+            raise ValueError("Z₀ must be positive.")
+
+        # Network config from schematic
+        network_config = self.schematic_editor.get_config()
+        if not network_config:
+            raise ValueError("Network is empty. Add at least one component.")
 
         if_bw_map = {
             "10 Hz": 10, "100 Hz": 100, "1 kHz": 1e3,
@@ -1241,6 +1965,6 @@ class MainWindow(QMainWindow):
 
         return dict(
             f_start=f_start, f_stop=f_stop, n_points=n_pts,
-            R=R, L=L, C=C, Z0=Z0,
+            Z0=Z0, network_config=network_config,
             sweep_type=sweep, if_bw=if_bw, output_power_dbm=pwr,
         )
