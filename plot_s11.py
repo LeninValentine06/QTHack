@@ -13,22 +13,25 @@ import matplotlib.ticker as ticker
 
 # ── Colour palette ────────────────────────────────────────────────────────────
 C = dict(
-    bg      = "#1e1e2e",
-    axes_bg = "#181825",
-    grid    = "#313244",
-    border  = "#45475a",
-    text    = "#cdd6f4",
-    subtext = "#a6adc8",
-    blue    = "#89b4fa",
-    red     = "#f38ba8",
-    green   = "#a6e3a1",
-    yellow  = "#f9e2af",
-    mauve   = "#cba6f7",
-    peach   = "#fab387",
-    teal    = "#94e2d5",
-    lavender= "#b4befe",
-    sky     = "#89dceb",
-    sapphire= "#74c7ec",
+    # Plot backgrounds matched to gui.py navy palette
+    bg      = "#161b22",   # BG1 — outer figure
+    axes_bg = "#0d1117",   # BG0 — inner axes
+    grid    = "#21262d",   # BG2 — grid lines (low opacity)
+    border  = "#30363d",   # BORD2 — spine / tick marks
+    text    = "#e6edf3",   # TEXT1
+    subtext = "#8b949e",   # TEXT2
+    # Trace colours aligned with 4-colour palette (same as _TRACE_COLORS)
+    blue    = "#58a6ff",   # S11 / Log Mag — CH1
+    green   = "#3fb950",   # Phase — CH2 green
+    yellow  = "#d29922",   # VSWR / markers
+    red     = "#f85149",   # resonance vline / stop marker
+    # Kept for backward compat (reference lines, Smith chart, etc.)
+    peach   = "#d29922",   # remapped to yellow
+    teal    = "#3fb950",   # remapped to green
+    mauve   = "#d29922",   # remapped to yellow
+    lavender= "#8b949e",   # grey
+    sky     = "#58a6ff",   # remapped to blue
+    sapphire= "#58a6ff",   # remapped to blue
 )
 
 # All available plot modes
@@ -60,17 +63,17 @@ Y_LIMITS = {
 # Reference lines per mode: (value, color, label)
 REF_LINES = {
     "Log Mag (dB)": [
-        (-6,  C["peach"], "−6 dB (VSWR≈3.0)"),
-        (-10, C["green"], "−10 dB (VSWR≈1.9)"),
-        (-20, C["teal"],  "−20 dB (VSWR≈1.2)"),
+        (-6,  "#484f58", "−6 dB"),     # grey — least critical
+        (-10, "#d29922", "−10 dB"),    # yellow — match marker/warning colour
+        (-20, "#3fb950", "−20 dB"),    # green — good match indicator
     ],
     "Linear Mag": [
-        (0.316, C["peach"], "0.316 (−10 dB)"),
-        (0.100, C["teal"],  "0.100 (−20 dB)"),
+        (0.316, "#d29922", "0.316 (−10 dB)"),
+        (0.100, "#3fb950", "0.100 (−20 dB)"),
     ],
     "VSWR": [
-        (2.0, C["green"], "VSWR = 2.0"),
-        (3.0, C["peach"], "VSWR = 3.0"),
+        (2.0, "#3fb950", "VSWR = 2.0"),
+        (3.0, "#d29922", "VSWR = 3.0"),
     ],
     "Phase (deg)":      [],
     "Unwrapped Phase":  [],
@@ -80,8 +83,10 @@ REF_LINES = {
     "Polar":            [],
 }
 
-MARKER_COLORS = [C["mauve"], C["peach"], C["green"], C["teal"],
-                 C["sapphire"], C["lavender"], C["sky"], C["yellow"]]
+# M1=yellow, M2=blue — strictly 2 primary marker colours.
+# Cycles for M3-M8 but those are rare in practice.
+MARKER_COLORS = ["#d29922", "#58a6ff", "#3fb950", "#8b949e",
+                 "#d29922", "#58a6ff", "#3fb950", "#8b949e"]
 MAX_MARKERS = 8
 
 
@@ -93,11 +98,52 @@ def _fmt_freq(f: float) -> str:
 
 
 def _freq_fmt_tick(x, _pos):
-    if x <= 0: return ""
-    if x >= 1e9: return f"{x/1e9:.4g} GHz"
-    if x >= 1e6: return f"{x/1e6:.4g} MHz"
-    if x >= 1e3: return f"{x/1e3:.4g} kHz"
-    return f"{x:.4g} Hz"
+    """
+    Human-readable frequency tick label — always returns a clean unit string.
+    Handles both log and linear sweeps across any frequency range.
+    Examples: 100 MHz, 1 GHz, 2.4 GHz, 500 kHz.
+    """
+    if x <= 0:
+        return ""
+    if x >= 1e9:
+        v = x / 1e9
+        # Show 1 decimal only when fractional part is significant
+        return f"{v:.3g} GHz"
+    if x >= 1e6:
+        return f"{x/1e6:.3g} MHz"
+    if x >= 1e3:
+        return f"{x/1e3:.3g} kHz"
+    return f"{x:.3g} Hz"
+
+
+def _configure_freq_axis(ax, freqs, sweep):
+    """
+    Set up a clean frequency X axis for both log and linear sweeps.
+
+    For log sweeps:  FormatStrFormatter is overridden with our _freq_fmt_tick
+                     so ticks always show '1 GHz', '2 GHz' etc., never '1e9'.
+    For linear sweeps: same formatter, with MaxNLocator for even spacing.
+    """
+    import matplotlib.ticker as _ticker
+
+    formatter = _ticker.FuncFormatter(_freq_fmt_tick)
+    ax.xaxis.set_major_formatter(formatter)
+    ax.xaxis.set_minor_formatter(_ticker.NullFormatter())
+
+    if sweep == "log":
+        ax.set_xscale("log")
+        # Replace matplotlib's default LogLocator (which may emit 1e9 labels)
+        # with one that hits decade multiples: 1, 2, 5 × 10^n
+        ax.xaxis.set_major_locator(
+            _ticker.LogLocator(base=10.0, numticks=8))
+        ax.xaxis.set_minor_locator(
+            _ticker.LogLocator(base=10.0, subs=[2, 3, 4, 5, 6, 7, 8, 9],
+                               numticks=50))
+    else:
+        ax.set_xscale("linear")
+        ax.xaxis.set_major_locator(_ticker.MaxNLocator(nbins=8, prune="both"))
+
+    ax.tick_params(axis="x", labelrotation=25, labelsize=7)
 
 
 class VNACanvas(FigureCanvas):
@@ -156,16 +202,33 @@ class VNACanvas(FigureCanvas):
 
     # ── Data selector ─────────────────────────────────────────────────────────
 
+    # Strict 4-colour palette matching gui.py:
+    #   Blue  (#58a6ff) → S11 / Log Mag (CH1)
+    #   Green (#3fb950) → Phase / Unwrapped Phase
+    #   Yellow(#d29922) → VSWR / Group Delay / linear quantities
+    #   Grey  (#8b949e) → Z plots (least used)
+    _TRACE_COLORS = {
+        "Log Mag (dB)":    "#58a6ff",   # blue  — primary S11
+        "Linear Mag":      "#58a6ff",   # blue  — same channel
+        "VSWR":            "#d29922",   # yellow — mismatch metric
+        "Phase (deg)":     "#3fb950",   # green — phase
+        "Unwrapped Phase": "#3fb950",   # green
+        "Group Delay (ns)":"#d29922",   # yellow
+        "Real Z (Ω)":      "#8b949e",   # grey
+        "Imaginary Z (Ω)": "#8b949e",   # grey
+    }
+
     def _get_y(self, result, mode):
-        if mode == "Log Mag (dB)":       return result["s11_db"],          "S11 (dB)",       C["blue"]
-        if mode == "Linear Mag":          return np.abs(result["gamma"]),   "|Γ|",            C["mauve"]
-        if mode == "VSWR":                return result["vswr"],             "VSWR",           C["peach"]
-        if mode == "Phase (deg)":         return result["phase_deg"],        "Phase (°)",      C["green"]
-        if mode == "Unwrapped Phase":     return result["phase_unwrapped"],  "Phase (°)",      C["teal"]
-        if mode == "Group Delay (ns)":    return result["group_delay_ns"],   "Group Delay (ns)",C["yellow"]
-        if mode == "Real Z (Ω)":          return result["z_real"],           "Re(Z) (Ω)",      C["sapphire"]
-        if mode == "Imaginary Z (Ω)":     return result["z_imag"],           "Im(Z) (Ω)",      C["lavender"]
-        return None, "", C["blue"]
+        col = self._TRACE_COLORS.get(mode, "#58a6ff")
+        if mode == "Log Mag (dB)":       return result["s11_db"],          "S11 (dB)",        col
+        if mode == "Linear Mag":          return np.abs(result["gamma"]),   "|Γ|",             col
+        if mode == "VSWR":                return result["vswr"],             "VSWR",            col
+        if mode == "Phase (deg)":         return result["phase_deg"],        "Phase (°)",       col
+        if mode == "Unwrapped Phase":     return result["phase_unwrapped"],  "Phase (°)",       col
+        if mode == "Group Delay (ns)":    return result["group_delay_ns"],   "Group Delay (ns)",col
+        if mode == "Real Z (Ω)":          return result["z_real"],           "Re(Z) (Ω)",       col
+        if mode == "Imaginary Z (Ω)":     return result["z_imag"],           "Im(Z) (Ω)",       col
+        return None, "", "#58a6ff"
 
     # ── Core drawing ─────────────────────────────────────────────────────────
 
@@ -198,11 +261,8 @@ class VNACanvas(FigureCanvas):
 
         y, ylabel, ycolor = self._get_y(result, mode)
 
-        # X scale
-        if sweep == "log":
-            ax.set_xscale("log")
-        ax.xaxis.set_major_formatter(ticker.FuncFormatter(_freq_fmt_tick))
-        ax.tick_params(axis="x", labelrotation=25, labelsize=7)
+        # X axis — use centralised helper for consistent units across both canvases
+        _configure_freq_axis(ax, freqs, sweep)
         ax.set_xlabel("Frequency (log scale)" if sweep == "log" else "Frequency")
         ax.set_ylabel(ylabel)
         ax.set_title(f"{ylabel} vs Frequency")
