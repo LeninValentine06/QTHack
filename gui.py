@@ -1182,7 +1182,9 @@ class SimWorker(QThread):
     def run(self):
         try:
             p      = self.params
-            config = p.pop("network_config", None)
+            config = p.get("network_config")                   # Fix #4: no mutation
+            p_fwd  = {k: v for k, v in p.items()
+                      if k != "network_config"}
             sweep  = p.get("sweep_type", "log")
             if config is not None:
                 freqs = (np.linspace(p["f_start"], p["f_stop"], p["n_points"])
@@ -1196,7 +1198,7 @@ class SimWorker(QThread):
                 result["output_power_dbm"] = p.get("output_power_dbm", -10.0)
                 self.finished.emit(result)
             else:
-                self.finished.emit(run_simulation(**p))
+                self.finished.emit(run_simulation(**p_fwd))
         except Exception as e:
             self.error.emit(str(e))
 

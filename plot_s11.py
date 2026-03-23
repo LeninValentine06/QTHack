@@ -49,7 +49,7 @@ PLOT_MODES = [
 
 # Fixed y-axis limits for consistent VNA display
 Y_LIMITS = {
-    "Log Mag (dB)":      (-40.0,  0.0),
+    "Log Mag (dB)":      None,         # Fix #5: adaptive — see _draw_cartesian
     "Linear Mag":        (0.0,    1.0),
     "VSWR":              (1.0,   50.0),
     "Phase (deg)":       (-180.0, 180.0),
@@ -224,11 +224,16 @@ class VNACanvas(FigureCanvas):
         if mode == "Linear Mag":          return np.abs(result["gamma"]),   "|Γ|",             col
         if mode == "VSWR":                return np.minimum(result["vswr"], 50.0), "VSWR",            col
         if mode == "Phase (deg)":
-            # Insert NaN at wrap boundaries so matplotlib draws a gap instead of
-            # a vertical line jumping ±360° across the wrap point.
-            ph = result["phase_deg"].copy().astype(float)
-            ph[np.abs(np.diff(ph, prepend=ph[0])) > 180.0] = np.nan
-            return ph, "Phase (°)", col
+            # Fix #6: detect wraps by comparing unwrapped and wrapped phase.
+            # A genuine wrap event is where they diverge by ~360°.
+            # The old prepend-diff threshold misfired on sparse sweeps where
+            # legitimate fast phase swings also exceed 180°.
+            uw  = result["phase_unwrapped"]
+            raw = result["phase_deg"].copy().astype(float)
+            wrap_events = np.where(
+                np.abs(np.diff(uw) - np.diff(raw)) > 180.0)[0] + 1
+            raw[wrap_events] = np.nan
+            return raw, "Phase (°)", col
         if mode == "Unwrapped Phase":     return result["phase_unwrapped"],  "Phase (°)",       col
         if mode == "Group Delay (ns)":    return result["group_delay_ns"],   "Group Delay (ns)",col
         if mode == "Real Z (Ω)":          return result["z_real"],           "Re(Z) (Ω)",       col
@@ -274,17 +279,19 @@ class VNACanvas(FigureCanvas):
 
         ax.plot(freqs, y, color=ycolor, linewidth=1.8, zorder=3)
 
-        # Y limits
+        # Y limits — Fix #5: Log Mag uses adaptive floor instead of hardcoded -40
         ylim = Y_LIMITS.get(mode)
         if ylim is not None:
             ax.set_ylim(*ylim)
+        elif mode == "Log Mag (dB)":
+            y_clean = y[np.isfinite(y)]
+            y_min   = float(y_clean.min()) if len(y_clean) else -40.0
+            floor   = max(y_min - 5.0, -80.0)   # 5 dB headroom, cap at -80
+            ax.set_ylim(floor, 2.0)
         else:
-            ymin, ymax = float(y.min()), float(y.max())
+            ymin, ymax = float(np.nanmin(y)), float(np.nanmax(y))
             span = ymax - ymin
             if span < 1e-6:
-                # Flat signal (e.g. Re(Z)=73 Ω constant) — pad by 20% of the
-                # value magnitude so the axis isn't a ±1 Ω window that makes
-                # sub-pixel rendering noise look like huge oscillations.
                 pad = max(abs(ymax) * 0.20, 1.0)
             else:
                 pad = span * 0.12
@@ -297,12 +304,13 @@ class VNACanvas(FigureCanvas):
                 ax.axhline(ref, color=col, linestyle="--",
                            linewidth=0.7, alpha=0.65, label=lbl)
 
-        # Resonance vline (all Cartesian modes)
-        bw    = result["bandwidth"]
-        f_res = bw["f_res"]
-        ax.axvline(f_res, color=C["red"], linestyle=":",
-                   linewidth=1.0, alpha=0.75, zorder=2,
-                   label=f"Res {_fmt_freq(f_res)}")
+        # Resonance vline — Fix #8: only when valid and in-sweep range
+        bw = result["bandwidth"]
+        rc = result.get("resonance_check", {})
+        if bw["valid"] and not rc.get("outside_sweep", False):
+            ax.axvline(bw["f_res"], color=C["red"], linestyle=":",
+                       linewidth=1.0, alpha=0.75, zorder=2,
+                       label=f"Res {_fmt_freq(bw['f_res'])}")
 
         # -10 dB BW shading (log mag only)
         if mode == "Log Mag (dB)" and bw["valid"]:
@@ -376,14 +384,13 @@ class VNACanvas(FigureCanvas):
 
         if self._is_polar:
             gamma = result["gamma"]
-            # Find nearest point in polar Γ-plane
-            dists = (gamma.real - np.cos(x_data)*y_data)**2 + \
-                    (gamma.imag - np.sin(x_data)*y_data)**2 \
-                    if y_data is not None else \
-                    (np.abs(gamma) - y_data)**2
-            # x_data=theta, y_data=r in polar axes
-            dists = (np.angle(gamma) - x_data)**2 + \
-                    (np.abs(gamma)   - (y_data or 0))**2
+            # Wrap-safe angular distance in the Γ-plane
+            # x_data = theta (angle), y_data = r (magnitude) from polar axes click
+            angle_diff = np.arctan2(
+                np.sin(np.angle(gamma) - x_data),
+                np.cos(np.angle(gamma) - x_data),
+            )
+            dists = angle_diff**2 + (np.abs(gamma) - (y_data or 0.0))**2
             idx = int(np.argmin(dists))
         else:
             # Log-domain nearest for log sweep
@@ -439,10 +446,9 @@ class VNACanvas(FigureCanvas):
             elif mode == "Imaginary Z (Ω)":    yv = result["z_imag"][idx]
             else:                              yv = y[idx]
 
-            # Clamp to visible range
-            ylim = Y_LIMITS.get(mode)
-            if ylim:
-                yv = float(np.clip(yv, ylim[0], ylim[1]))
+            # Clamp to visible axis range (works for adaptive and fixed limits)
+            y_lo_ax, y_hi_ax = ax.get_ylim()
+            yv = float(np.clip(yv, y_lo_ax, y_hi_ax))
 
             ax.axvline(f, color=color, linestyle="-.", linewidth=0.9,
                        alpha=0.8, zorder=6)

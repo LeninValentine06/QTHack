@@ -5,6 +5,7 @@ smith_chart.py  —  Smith chart canvas with numbered markers.
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from matplotlib.collections import LineCollection
 
 try:
     import skrf
@@ -178,10 +179,13 @@ class SmithCanvas(FigureCanvas):
             self._plot_gradient_trace(gamma.real, gamma.imag, n)
 
     def _plot_gradient_trace(self, re, im, n):
-        for i in range(n - 1):
-            t   = i / max(n - 2, 1)
-            col = (t*0.9, 0.25, 1.0 - t*0.9, 0.85)
-            self.ax.plot(re[i:i+2], im[i:i+2], color=col, linewidth=1.8)
+        # Fix #7: single LineCollection instead of O(N) ax.plot calls
+        pts  = np.column_stack([re, im]).reshape(-1, 1, 2)
+        segs = np.concatenate([pts[:-1], pts[1:]], axis=1)
+        t    = np.linspace(0, 1, max(n - 1, 1))
+        cols = [(v * 0.9, 0.25, 1.0 - v * 0.9, 0.85) for v in t]
+        lc   = LineCollection(segs, colors=cols, linewidth=1.8)
+        self.ax.add_collection(lc)
 
     # ── Marker placement ──────────────────────────────────────────────────────
 

@@ -324,11 +324,12 @@ def _sfg_terminate(cascaded: Optional["skrf.Network"],
         gamma_in  = S11 + (S12 * gamma_L * S21) / denom_sfg
 
 # Recover input impedance from Γ_in
-    # Use a larger epsilon here — 1e-6 prevents noise when |Γ|→1 (far from
-    # resonance) where floating-point cancellation in (1 - Γ) causes wild
-    # swings in Re(Z). This only affects display; S11/VSWR/phase are unaffected.
+    # Fix #9: use 1e-9 instead of 1e-6. The old 1e-6 guard clamped Z_in
+    # to ~100 MΩ for |Γ| > 0.999999, which hides legitimate high-impedance
+    # display values (e.g. open-stub resonators). 1e-9 still prevents
+    # NaN/inf from exact Γ=1 while allowing realistic Z values through.
     denom_z = 1.0 - gamma_in
-    denom_z = np.where(np.abs(denom_z) < 1e-6, 1e-6 + 0j, denom_z)
+    denom_z = np.where(np.abs(denom_z) < 1e-9, 1e-9 + 0j, denom_z)
     Z_in    = Z0 * (1.0 + gamma_in) / denom_z
 
     return gamma_in, Z_in
@@ -392,13 +393,10 @@ def _return_loss(gamma: np.ndarray) -> np.ndarray:
     return -_s11_db(gamma)
 
 def _group_delay_ns(freqs: np.ndarray, gamma: np.ndarray) -> np.ndarray:
-    """Non-uniform finite-difference group delay (ns). Mirrors rf_engine."""
+    """Non-uniform finite-difference group delay (ns). Fix #1: np.gradient(y, x)."""
     phase_rad = np.unwrap(np.angle(gamma))
     omega     = 2.0 * np.pi * freqs
-    dphi      = np.gradient(phase_rad)
-    domega    = np.gradient(omega)
-    domega    = np.where(np.abs(domega) < _EPS, _EPS, domega)
-    gd_ns     = -(dphi / domega) * 1e9
+    gd_ns     = -np.gradient(phase_rad, omega) * 1e9
     q25, q75  = np.percentile(gd_ns, [25, 75])
     iqr        = max(q75 - q25, 1.0)
     return np.clip(gd_ns, q25 - 5.0 * iqr, q75 + 5.0 * iqr)

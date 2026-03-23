@@ -155,26 +155,18 @@ def _compute_group_delay(freqs: np.ndarray, gamma: np.ndarray) -> np.ndarray:
     """
     Group delay:  tau = -dphi/domega  (nanoseconds)
 
-    Correct non-uniform finite difference for log sweeps:
+    np.gradient(y, x) computes dy/dx with correct non-uniform spacing —
+    this is the right call for log sweeps.  The old manual dphi/domega
+    computation was equivalent only for uniform spacing and gave wrong
+    values at every interior point on a log sweep.
 
-        dphi/domega = np.gradient(phi) / np.gradient(omega)
-
-    Passing omega as the spacing argument to np.gradient (old approach)
-    assumes uniform spacing — incorrect for log sweeps.
-
-    IQR spike clip removes edge artefacts from gradient boundary
-    differences.  This is a display-only fix; it does not alter physics.
+    IQR spike clip removes boundary artefacts (display only).
     """
     phase_rad = np.unwrap(np.angle(gamma))
     omega     = 2.0 * np.pi * freqs
 
-    dphi   = np.gradient(phase_rad)
-    domega = np.gradient(omega)
-    domega = np.where(np.abs(domega) < _EPS, _EPS, domega)
+    gd_ns = -np.gradient(phase_rad, omega) * 1e9     # Fix #1: single call
 
-    gd_ns = -(dphi / domega) * 1e9                    # convert s to ns
-
-    # Clip edge spikes only — does not change interior physics values
     q25, q75 = np.percentile(gd_ns, [25, 75])
     iqr       = max(q75 - q25, 1.0)
     gd_ns     = np.clip(gd_ns, q25 - 5.0 * iqr, q75 + 5.0 * iqr)
