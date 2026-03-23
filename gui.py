@@ -333,191 +333,168 @@ class ReadoutCard(QWidget):
 
 # ─── Schematic Editor ──────────────────────────────────────────────────────────
 #
-# ANSI/IEEE standard schematic symbols, pixel-perfect geometry.
+# Mixed-topology schematic: series elements on the signal rail,
+# shunt elements dropping to ground.
 #
-# Symbol standard: ANSI throughout (zigzag R, coil L, parallel-plate C).
+# Component modes
+# ───────────────
+#   "series"  → drawn inline on the top rail (R, L, C)
+#   "shunt"   → drawn vertically from the rail to ground (R, L, C)
+#   "rlc"     → compound ladder block (series-L → shunt-C → series-R)
 #
-# Key geometry insight for coil arcs (QPainter.arcTo):
-#   arcTo(QRectF(x, y_wire-a, bw, 2*a), 180, -180)
-#     → CW semicircle; entry=(x, y_wire), exit=(x+bw, y_wire), peak=(x+bw/2, y_wire-a)
-#   This is the ONLY rect placement that puts both endpoints exactly on the wire.
+# RF backend mapping (network_engine.py)
+# ──────────────────────────────────────
+#   series element → {"type":"R"|"L"|"C", "value":...}   2-port cascade
+#   shunt element  → {"type":"R"|"L"|"C", "value":...}   treated as load branch
+#                    (shunt-only networks still work as before)
+#   rlc block      → {"type":"RLC", R, L, C}              last element = load
 #
-# For the shunt (vertical) inductor we rotate the painter 90° CW so the
-# horizontal bump formula applies unchanged, then restore the transform.
+# Layout engine
+# ─────────────
+#   x = start
+#   for each component:
+#       place at x
+#       if series or rlc  → x += component_width   (advances rail)
+#       if shunt          → x unchanged for NEXT component
+#         (shunt hangs off the current node; the node x is shared)
 #
-# Layout:
-#   Two horizontal rails separated by _H px.
-#   R, L, C  → shunt columns, _PITCH wide.
-#   RLC      → ladder section, _RLC_W wide:
-#              PORT──[L series]──●──[R series]──OUT
-#                                │
-#                               [C shunt]
-#                                │
-#                               GND
+# Symbol standard: ANSI throughout.
+#   Series R → zigzag on wire
+#   Series L → coil bumps above wire
+#   Series C → two vertical bars across wire  (--| |---)
+#   Shunt  R → IEC rectangle (vertical)
+#   Shunt  L → coil bumps left of wire (via 90° rotation)
+#   Shunt  C → parallel plates (vertical)
 
 # ── Grid & geometry constants ─────────────────────────────────────────────────
-_TOP_Y   = -110    # Y coordinate of signal (top) rail  (scene space)
-_BOT_Y   =  110    # Y coordinate of ground (bottom) rail
-_H       = _BOT_Y - _TOP_Y          # 220 px  — vertical span
+_TOP_Y      = -110   # Y of signal (top) rail
+_BOT_Y      =  110   # Y of ground (bottom) rail
+_H          = _BOT_Y - _TOP_Y           # 220 px — vertical span
 
-_PITCH   = 150     # horizontal column width for a single R / L / C
-_RLC_W   = 420     # horizontal width of a full RLC ladder block
+_SERIES_W   = 140    # width of a single series R / L / C
+_SHUNT_W    = 120    # width allocated to a shunt element (for label space)
+_RLC_W      = 420    # width of a full RLC ladder block
+_PORT_X     =  60    # X of PORT circle
 
-_PORT_X  =  60     # X of left port circle
+# ── Colours ───────────────────────────────────────────────────────────────────
+_SIG_C      = "#58a6ff"   # blue   — signal path
+_GND_C      = "#6e7681"   # grey   — ground
+_LOAD_C     = "#d29922"   # amber  — terminal load
+_SERIES_C   = "#58a6ff"   # same as signal (series elements are on the path)
+_SHUNT_C    = "#58a6ff"   # shunt elements
+_LBL_C      = "#a6adc8"   # label text
+_NODE_C     = "#58a6ff"   # junction dots
 
-# ── Colour palette ────────────────────────────────────────────────────────────
-_SIG_C   = "#58a6ff"   # blue  — signal rail, components
-_GND_C   = "#6e7681"   # grey  — ground rail
-_LOAD_C  = "#d29922"   # amber — terminal load
-_LBL_C   = "#a6adc8"   # dim label text
-
-# ── Pen / colour helpers ──────────────────────────────────────────────────────
+# ── Pen helpers ───────────────────────────────────────────────────────────────
 def _qc(h):
     return QColor(h)
 
 def _wp(col, w=2.0):
-    """Round-cap, round-join solid pen — essential for clean arc joins."""
     p = QPen(_qc(col), w)
     p.setCapStyle(Qt.PenCapStyle.RoundCap)
     p.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
     return p
 
 def _nb():
-    """No brush."""
     return Qt.BrushStyle.NoBrush
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PRIMITIVE SYMBOL FUNCTIONS
-# All functions draw in LOCAL component coordinates:
-#   top rail  = y=0
-#   bot rail  = y=_H
-#   component centre = x=0
+#  PRIMITIVE DRAWING FUNCTIONS
+#  All coordinates are LOCAL to the component item:
+#    y=0   → top rail
+#    y=_H  → bottom rail
+#    x=0   → column centre
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Resistor ──────────────────────────────────────────────────────────────────
-
-def _sym_resistor_h(painter, x0, x1, y, col):
-    """
-    ANSI zigzag resistor on a horizontal wire.
-    6 peaks, amplitude ±10 px.  Wire stubs on both sides.
-    """
-    n_peaks = 6
-    amp     = 10
-    body_w  = (x1 - x0) * 0.55
-    cx      = (x0 + x1) * 0.5
-    bx      = cx - body_w * 0.5   # body left x
-    seg     = body_w / n_peaks
-
-    painter.setPen(_wp(col, 2.2))
-    painter.setBrush(_nb())
+# ── Series resistor (ANSI zigzag, horizontal) ─────────────────────────────────
+def _sym_R_series(painter, x0, x1, y, col):
+    n, amp  = 6, 10
+    body_w  = (x1 - x0) * 0.56
+    bx      = (x0 + x1) * 0.5 - body_w * 0.5
+    seg     = body_w / n
+    painter.setPen(_wp(col, 2.2));  painter.setBrush(_nb())
     painter.drawLine(QPointF(x0, y), QPointF(bx, y))
-
     path = QPainterPath()
     path.moveTo(bx, y)
-    for i in range(n_peaks):
+    for i in range(n):
         path.lineTo(bx + (i + 0.5) * seg, y - amp if i % 2 == 0 else y + amp)
         path.lineTo(bx + (i + 1.0) * seg, y)
     painter.drawPath(path)
     painter.drawLine(QPointF(bx + body_w, y), QPointF(x1, y))
 
 
-def _sym_resistor_v(painter, cx, top_y, bot_y, col):
-    """
-    IEC rectangle for a VERTICAL (shunt) resistor.
-    Rectangle centred on the wire, stubs top & bottom.
-    """
+# ── Shunt resistor (IEC rectangle, vertical) ──────────────────────────────────
+def _sym_R_shunt(painter, cx, top_y, bot_y, col):
     span = bot_y - top_y
-    bh   = span * 0.40
-    bw   = 24
-    mcy  = (top_y + bot_y) * 0.5
-
-    painter.setPen(_wp(col, 2.2))
-    painter.setBrush(_nb())
+    bh, bw = span * 0.40, 24
+    mcy = (top_y + bot_y) * 0.5
+    painter.setPen(_wp(col, 2.2));  painter.setBrush(_nb())
     painter.drawLine(QPointF(cx, top_y), QPointF(cx, mcy - bh * 0.5))
     painter.drawRect(QRectF(cx - bw * 0.5, mcy - bh * 0.5, bw, bh))
     painter.drawLine(QPointF(cx, mcy + bh * 0.5), QPointF(cx, bot_y))
 
 
-# ── Inductor ──────────────────────────────────────────────────────────────────
-
-def _sym_inductor_h(painter, x0, x1, y, col):
+# ── Series inductor (ANSI bumps above wire) ───────────────────────────────────
+def _sym_L_series(painter, x0, x1, y, col):
     """
-    ANSI coil — 4 semicircular bumps ABOVE the wire.
-
-    Geometry (proven correct):
-      Each bump i: arcTo(QRectF(bx+i*bw, y-a, bw, 2*a), 180, -180)
-        entry = left-midpoint  = (bx+i*bw,     y)   ← exactly on wire
-        exit  = right-midpoint = (bx+(i+1)*bw, y)   ← exactly on wire
-        peak  = top-centre     = (bx+(i+0.5)*bw, y-a)
-    No gaps, no overlaps with the wire.
+    arcTo(QRectF(bx+i*bw, y-a, bw, 2*a), 180, -180)
+    Entry/exit at (bx+i*bw, y) and (bx+(i+1)*bw, y) — exactly on wire.
     """
-    N   = 4          # number of bumps
-    a   = 14         # half-height of arc rect  → bump protrudes 'a' px above wire
-    bw  = (x1 - x0) * 0.58 / N   # width of each bump
-    bx  = (x0 + x1) * 0.5 - N * bw * 0.5   # left edge of first bump
-
-    painter.setPen(_wp(col, 2.2))
-    painter.setBrush(_nb())
-
-    # Left stub
+    N, a = 4, 14
+    bw   = (x1 - x0) * 0.58 / N
+    bx   = (x0 + x1) * 0.5 - N * bw * 0.5
+    painter.setPen(_wp(col, 2.2));  painter.setBrush(_nb())
     painter.drawLine(QPointF(x0, y), QPointF(bx, y))
-
     path = QPainterPath()
     path.moveTo(bx, y)
     for i in range(N):
         path.arcTo(QRectF(bx + i * bw, y - a, bw, 2 * a), 180, -180)
-
     painter.drawPath(path)
-    # Right stub
     painter.drawLine(QPointF(bx + N * bw, y), QPointF(x1, y))
 
 
-def _sym_inductor_v(painter, cx, top_y, bot_y, col):
-    """
-    ANSI coil — 4 bumps LEFT of the vertical wire.
-
-    Strategy: rotate the painter 90° CW around the wire midpoint so that
-    the vertical wire becomes horizontal, draw _sym_inductor_h, restore.
-    This reuses the proven-correct horizontal geometry exactly.
-
-    After 90° CW rotation:
-      The wire runs left→right at y=0 in rotated space.
-      'top_y' in original space → x-direction in rotated space.
-    """
-    span = bot_y - top_y
+# ── Shunt inductor (bumps left of wire, via rotation) ────────────────────────
+def _sym_L_shunt(painter, cx, top_y, bot_y, col):
+    span  = bot_y - top_y
     mid_y = (top_y + bot_y) * 0.5
-
     painter.save()
-    # Translate to midpoint of wire, rotate 90° CW
     painter.translate(cx, mid_y)
-    painter.rotate(90)
-    # Now the wire runs horizontally from -span/2 to +span/2 at y=0
-    # Draw bumps 'above' this rotated wire = to the LEFT in original space ✓
-    _sym_inductor_h(painter, -span * 0.5, span * 0.5, 0, col)
+    painter.rotate(90)          # vertical wire → horizontal; bumps go left
+    _sym_L_series(painter, -span * 0.5, span * 0.5, 0, col)
     painter.restore()
 
 
-# ── Capacitor ─────────────────────────────────────────────────────────────────
-
-def _sym_capacitor_v(painter, cx, top_y, bot_y, sig_col, gnd_col):
+# ── Series capacitor (two vertical bars across wire: --| |--) ─────────────────
+def _sym_C_series(painter, x0, x1, y, col):
     """
-    Two parallel plates, vertical (shunt).
-    Upper plate = signal colour; lower plate = ground colour.
-    Gap = 12 px; plate width = 44 px.
+    Two parallel vertical bars centred on the wire.
+    Plate height = 26 px.  Gap = 10 px.
+    Wire stubs connect x0→left-plate and right-plate→x1.
     """
-    mid = (top_y + bot_y) * 0.5
-    gap = 12
-    pw  = 44
+    gap  = 10
+    ph   = 26      # plate height
+    cx   = (x0 + x1) * 0.5
+    painter.setPen(_wp(col, 2.2));  painter.setBrush(_nb())
+    # Left stub
+    painter.drawLine(QPointF(x0, y), QPointF(cx - gap * 0.5, y))
+    # Left plate (vertical bar)
+    painter.drawLine(QPointF(cx - gap * 0.5, y - ph * 0.5),
+                     QPointF(cx - gap * 0.5, y + ph * 0.5))
+    # Right plate
+    painter.drawLine(QPointF(cx + gap * 0.5, y - ph * 0.5),
+                     QPointF(cx + gap * 0.5, y + ph * 0.5))
+    # Right stub
+    painter.drawLine(QPointF(cx + gap * 0.5, y), QPointF(x1, y))
 
-    # Signal half
-    painter.setPen(_wp(sig_col, 2.2))
-    painter.setBrush(_nb())
-    painter.drawLine(QPointF(cx, top_y), QPointF(cx, mid - gap * 0.5))
+
+# ── Shunt capacitor (parallel plates, vertical) ───────────────────────────────
+def _sym_C_shunt(painter, cx, top_y, bot_y, sig_col, gnd_col):
+    mid, gap, pw = (top_y + bot_y) * 0.5, 12, 44
+    painter.setPen(_wp(sig_col, 2.2));  painter.setBrush(_nb())
+    painter.drawLine(QPointF(cx, top_y),     QPointF(cx, mid - gap * 0.5))
     painter.drawLine(QPointF(cx - pw * 0.5, mid - gap * 0.5),
                      QPointF(cx + pw * 0.5, mid - gap * 0.5))
-
-    # Ground half
     painter.setPen(_wp(gnd_col, 2.2))
     painter.drawLine(QPointF(cx - pw * 0.5, mid + gap * 0.5),
                      QPointF(cx + pw * 0.5, mid + gap * 0.5))
@@ -525,9 +502,7 @@ def _sym_capacitor_v(painter, cx, top_y, bot_y, sig_col, gnd_col):
 
 
 # ── Junction dot ──────────────────────────────────────────────────────────────
-
 def _sym_dot(painter, x, y, col, r=5.0):
-    """Filled T-junction dot."""
     painter.setPen(QPen(_qc(col), 1))
     painter.setBrush(QBrush(_qc(col)))
     painter.drawEllipse(QPointF(x, y), r, r)
@@ -535,42 +510,47 @@ def _sym_dot(painter, x, y, col, r=5.0):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# COMPONENT ITEM
+#  COMPONENT ITEM
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SchematicComponent(QGraphicsItem):
     """
-    One component column.
-    Item origin is placed at (column_centre_x, _TOP_Y) by the scene.
+    One component in the RF chain.
 
-    Local coordinate space:
-      y = 0    → top rail
-      y = _H   → bottom rail
-      x = 0    → column centre
+    comp_type: "R" | "L" | "C" | "RLC"
+    mode:      "series" | "shunt"
+      series → element sits inline on the top rail (advances X)
+      shunt  → element drops vertically from rail to ground (shares node X)
 
-    Width:
-      R / L / C → _PITCH
-      RLC       → _RLC_W
+    Local coordinate origin = (column_centre_x, _TOP_Y).
+    Local y=0 = top rail, y=_H = bottom rail.
     """
 
-    def __init__(self, comp_type, values, scene_ref, parent=None):
+    def __init__(self, comp_type, mode, values, scene_ref, parent=None):
         super().__init__(parent)
         self.comp_type  = comp_type
+        self.mode       = mode          # "series" | "shunt"
         self.values     = dict(values)
         self._scene_ref = scene_ref
         self._is_load   = False
         self._hovered   = False
         self.setFlags(
-            QGraphicsItem.GraphicsItemFlag.ItemIsMovable      |
-            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable   |
+            QGraphicsItem.GraphicsItemFlag.ItemIsMovable     |
+            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable  |
             QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges,
         )
         self.setAcceptHoverEvents(True)
 
     # ── Geometry ──────────────────────────────────────────────────────────────
 
+    def col_width(self):
+        """Horizontal space this component occupies in the layout."""
+        if self.comp_type == "RLC":          return _RLC_W
+        if self.mode == "series":            return _SERIES_W
+        return _SHUNT_W                      # shunt: allocate space for labels
+
     def _half_w(self):
-        return (_RLC_W // 2) if self.comp_type == "RLC" else (_PITCH // 2)
+        return self.col_width() // 2
 
     def boundingRect(self):
         hw = self._half_w()
@@ -587,14 +567,17 @@ class SchematicComponent(QGraphicsItem):
         sig_c   = _LOAD_C if is_load else (_SIG_C if not hover else "#a8d4ff")
         gnd_c   = _GND_C
         t       = self.comp_type
+        m       = self.mode
+        hw      = self._half_w()
 
-        if   t == "R":   _sym_resistor_v (painter, 0, 0, _H, sig_c)
-        elif t == "L":   _sym_inductor_v (painter, 0, 0, _H, sig_c)
-        elif t == "C":   _sym_capacitor_v(painter, 0, 0, _H, sig_c, gnd_c)
-        elif t == "RLC": self._paint_rlc (painter, sig_c, gnd_c)
+        if t == "RLC":
+            self._paint_rlc(painter, sig_c, gnd_c)
+        elif m == "series":
+            self._paint_series(painter, sig_c, hw)
+        else:
+            self._paint_shunt(painter, sig_c, gnd_c, hw)
 
-        # ── Value label (above top rail) ──────────────────────────────────────
-        hw = self._half_w()
+        # ── Value label ───────────────────────────────────────────────────────
         painter.setPen(QPen(_qc(sig_c if is_load else _LBL_C), 1))
         painter.setFont(QFont("Consolas", 8))
         painter.drawText(
@@ -603,65 +586,72 @@ class SchematicComponent(QGraphicsItem):
             self._value_str(),
         )
 
-        # ── Type label (below bottom rail) ────────────────────────────────────
-        painter.setPen(QPen(_qc(sig_c), 1))
-        painter.setFont(QFont("Consolas", 7))
-        painter.drawText(
-            QRectF(-hw, _H + 8, hw * 2, 16),
-            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-            t + (" [LOAD]" if is_load else ""),
-        )
+        # ── Mode badge (⇒ series / ↓ shunt) ──────────────────────────────────
+        if t != "RLC":
+            badge = "⇒" if m == "series" else "↓"
+            painter.setPen(QPen(_qc("#4a5568"), 1))
+            painter.setFont(QFont("Consolas", 7))
+            painter.drawText(
+                QRectF(-hw, _H + 8, hw * 2, 14),
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                f"{t} {badge}" + (" [LOAD]" if is_load else ""),
+            )
+        else:
+            painter.setPen(QPen(_qc(sig_c), 1))
+            painter.setFont(QFont("Consolas", 7))
+            painter.drawText(
+                QRectF(-hw, _H + 8, hw * 2, 14),
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                "RLC" + (" [LOAD]" if is_load else ""),
+            )
+
+    def _paint_series(self, painter, sig_c, hw):
+        """Inline element on the top rail (y=0)."""
+        x0, x1 = -hw, hw
+        t = self.comp_type
+        if   t == "R": _sym_R_series(painter, x0, x1, 0, sig_c)
+        elif t == "L": _sym_L_series(painter, x0, x1, 0, sig_c)
+        elif t == "C": _sym_C_series(painter, x0, x1, 0, sig_c)
+
+        # Vertical drop line to bottom rail (shows signal path continues)
+        # Not drawn for series — the rail itself is the connection.
+
+    def _paint_shunt(self, painter, sig_c, gnd_c, hw):
+        """Vertical element from top rail to ground (y=0 → y=_H)."""
+        t = self.comp_type
+        if   t == "R": _sym_R_shunt(painter, 0, 0, _H, sig_c)
+        elif t == "L": _sym_L_shunt(painter, 0, 0, _H, sig_c)
+        elif t == "C": _sym_C_shunt(painter, 0, 0, _H, sig_c, gnd_c)
 
     def _paint_rlc(self, painter, sig_c, gnd_c):
         """
-        Ladder section — textbook layout:
-
-          x_left         x_mid           x_right
-            |              |               |
-        ────╗═══[L]═══╗────●────╗═══[R]═══╗────
-                           │
-                          [C]
-                           │
-        ────────────────────────────────────────
-
-        Spacing: L occupies left 38%, junction at centre, R occupies right 38%.
-        4% guard on each end for wire stubs.
+        Compound ladder:  ──[L]──●──[R]──
+                                  │
+                                 [C]
+                                  │
+                                 GND
         """
-        hw       = _RLC_W // 2
-        x_l      = -hw           # left edge
-        x_r      =  hw           # right edge
-        # Dividers — leave 10% stub on each end, split remaining 80% as L|gap|R
-        stub     = hw * 0.08
-        body     = hw * 0.82     # half of total body (one side)
-        x_lend   = -body * 0.10  # inductor ends just left of centre
-        x_rstart =  body * 0.10  # resistor starts just right of centre
-        x_mid    = 0             # junction node
+        hw      = _RLC_W // 2
+        x_l     = -hw
+        x_r     =  hw
+        x_mid   =  0
+        x_lend  = -hw * 0.22
+        x_rstart =  hw * 0.22
 
-        # Series L (left stub → x_lend)
-        _sym_inductor_h(painter, x_l, x_lend, 0, sig_c)
-
-        # Wire stub: x_lend → junction
+        _sym_L_series(painter, x_l, x_lend, 0, sig_c)
         painter.setPen(_wp(sig_c, 2.2))
         painter.drawLine(QPointF(x_lend, 0), QPointF(x_mid, 0))
-
-        # Junction dot
         _sym_dot(painter, x_mid, 0, sig_c)
-
-        # Shunt C (from junction down to bottom rail)
-        _sym_capacitor_v(painter, x_mid, 0, _H, sig_c, gnd_c)
-
-        # Wire stub: junction → x_rstart
+        _sym_C_shunt(painter, x_mid, 0, _H, sig_c, gnd_c)
         painter.setPen(_wp(sig_c, 2.2))
         painter.drawLine(QPointF(x_mid, 0), QPointF(x_rstart, 0))
-
-        # Series R (x_rstart → right edge)
-        _sym_resistor_h(painter, x_rstart, x_r, 0, sig_c)
+        _sym_R_series(painter, x_rstart, x_r, 0, sig_c)
 
     # ── Value string ──────────────────────────────────────────────────────────
 
     def _value_str(self):
         t, v = self.comp_type, self.values
-        def _f(val, u, s, d=1): return f"{val/s:.{d}f} {u}"
+        def _f(x, u, s, d=1): return f"{x/s:.{d}f} {u}"
         if t == "R":
             return _f(v.get("R", 0), "Ω", 1, 1)
         if t == "L":
@@ -696,15 +686,24 @@ class SchematicComponent(QGraphicsItem):
         return super().itemChange(change, value)
 
     def to_config_dict(self):
-        t, v = self.comp_type, self.values
-        if t == "R":   return {"type": "R",   "value": float(v.get("R",  50.0))}
-        if t == "L":   return {"type": "L",   "value": float(v.get("L",  1e-6))}
-        if t == "C":   return {"type": "C",   "value": float(v.get("C",  1e-9))}
-        if t == "RLC": return {"type": "RLC",
-                               "R": float(v.get("R",  50.0)),
-                               "L": float(v.get("L",  1e-6)),
-                               "C": float(v.get("C",  1e-9))}
+        """Map to network_engine format."""
+        t, v, m = self.comp_type, self.values, self.mode
+        if t == "R":
+            return {"type": "R", "value": float(v.get("R", 50.0)),
+                    "_mode": m}
+        if t == "L":
+            return {"type": "L", "value": float(v.get("L", 1e-6)),
+                    "_mode": m}
+        if t == "C":
+            return {"type": "C", "value": float(v.get("C", 1e-9)),
+                    "_mode": m}
+        if t == "RLC":
+            return {"type": "RLC",
+                    "R": float(v.get("R", 50.0)),
+                    "L": float(v.get("L", 1e-6)),
+                    "C": float(v.get("C", 1e-9))}
         return {}
+
 
 
 class SchematicScene(QGraphicsScene):
@@ -713,21 +712,28 @@ class SchematicScene(QGraphicsScene):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._components = []
-        self._static     = []   # static background items (rails, labels)
-        self.setSceneRect(-100, -120, 2400, 320)
+        self._static     = []
+        self.setSceneRect(-100, -160, 3200, 380)
 
     # ── Component management ──────────────────────────────────────────────────
 
-    def add_component(self, comp_type, values=None):
+    def add_component(self, comp_type, mode="shunt", values=None):
+        """
+        mode = "series" | "shunt"
+        RLC is always its own compound type (mode ignored).
+        """
         defs = {
             "R":   {"R": 50.0},
             "L":   {"L": 35e-9},
             "C":   {"C": 7e-12},
             "RLC": {"R": 73.0, "L": 35e-9, "C": 7e-12},
         }
-        comp = SchematicComponent(comp_type,
-                                  values if values else defs.get(comp_type, {}),
-                                  self)
+        m = "rlc" if comp_type == "RLC" else mode
+        comp = SchematicComponent(
+            comp_type, m,
+            values if values else defs.get(comp_type, {}),
+            self,
+        )
         self.addItem(comp)
         self._components.append(comp)
         self._layout()
@@ -760,17 +766,35 @@ class SchematicScene(QGraphicsScene):
         self._mark_load()
         self.config_changed.emit()
 
+    # ── Layout engine ─────────────────────────────────────────────────────────
+    #
+    # Rules:
+    #   series / RLC  → advance x by component width
+    #   shunt         → do NOT advance x (shares node with next series element)
+    #
+    # This matches the RF cascade model exactly:
+    #   series elements are 2-ports on the signal path
+    #   shunt elements are 1-port loads at a node
+    #
+    # When multiple shunts share a node (stacked shunts), they are drawn
+    # side-by-side and a junction dot marks the shared node on the top rail.
+
     def _layout(self):
         if not self._components:
             self._redraw_static()
             return
-        first_hw = (_RLC_W // 2) if self._components[0].comp_type == "RLC" else (_PITCH // 2)
-        x = _PORT_X + first_hw
+
+        x = _PORT_X
         for comp in self._components:
+            hw = comp._half_w()
+            x += hw                        # advance to component centre
             comp.setPos(x, _TOP_Y)
-            hw = (_RLC_W // 2) if comp.comp_type == "RLC" else (_PITCH // 2)
-            next_hw = hw  # same for gap between components
-            x += hw + next_hw
+            if comp.mode in ("series", "rlc"):
+                x += hw                    # advance past right edge
+            else:
+                # shunt: advance only enough for label, next series picks up
+                x += hw
+
         self._redraw_static()
         self._mark_load()
 
@@ -780,49 +804,45 @@ class SchematicScene(QGraphicsScene):
             c._is_load = (i == n - 1)
             c.update()
 
-    # ── Static background (rails + terminals) ─────────────────────────────────
+    # ── Static background ─────────────────────────────────────────────────────
 
     def _redraw_static(self):
         for item in self._static:
             self.removeItem(item)
         self._static.clear()
 
-        # Draw empty placeholder when no components
         if not self._components:
-            ph = self.addText(
-                "Add components using the buttons above",
-                QFont("Consolas", 10))
+            ph = self.addText("Add components using the buttons above",
+                              QFont("Consolas", 10))
             ph.setDefaultTextColor(_qc(_GND_C))
-            ph.setPos(40, _TOP_Y + _H/2 - 10)
+            ph.setPos(40, _TOP_Y + _H // 2 - 10)
             self._static.append(ph)
             return
 
         first_x = self._components[0].x()
         last_x  = self._components[-1].x()
-        first_hw = _RLC_W // 2 if self._components[0].comp_type == "RLC" else _PITCH // 2
-        last_hw  = _RLC_W // 2 if self._components[-1].comp_type == "RLC" else _PITCH // 2
-        left_x  = first_x - first_hw
-        right_x = last_x  + last_hw
+        first_hw = self._components[0]._half_w()
+        last_hw  = self._components[-1]._half_w()
+        left_x   = first_x - first_hw
+        right_x  = last_x  + last_hw
 
         sp = QPen(_qc(_SIG_C), 2.2)
         gp = QPen(_qc(_GND_C), 2.2)
-        tp = QPen(_qc("#3fb950"), 2.0)   # terminal green
+        tp = QPen(_qc("#3fb950"), 2.0)
 
         def add(item):
             self._static.append(item)
             return item
 
-        # ── Top rail — draw in segments, leaving gaps where RLC series elements sit ──
-        # For RLC components the series L and R sit ON the top rail wire, so the
-        # static rail must stop at the component's left edge and resume at its
-        # right edge.  The component's paint() draws the L and R inline instead.
-        # For R/L/C shunt components the rail runs straight through (just a dot).
+        # ── Top rail — segmented to leave gaps for series / RLC elements ──────
+        # Series and RLC components draw their own inline symbols on the rail.
+        # Shunt components just tap the rail; the rail runs straight through.
         seg_starts = [left_x]
         seg_ends   = []
         for comp in self._components:
-            cx  = comp.x()
-            if comp.comp_type == "RLC":
-                hw = _RLC_W // 2
+            cx = comp.x()
+            if comp.mode in ("series", "rlc"):
+                hw = comp._half_w()
                 seg_ends.append(cx - hw)
                 seg_starts.append(cx + hw)
         seg_ends.append(right_x)
@@ -833,17 +853,13 @@ class SchematicScene(QGraphicsScene):
         # ── Bottom rail ───────────────────────────────────────────────────────
         add(self.addLine(left_x, _TOP_Y + _H, right_x, _TOP_Y + _H, gp))
 
-        # ── Left vertical (port side) ─────────────────────────────────────────
-        add(self.addLine(left_x, _TOP_Y, left_x, _TOP_Y + _H, gp))
-
-        # ── Right vertical (output side) ──────────────────────────────────────
+        # ── Port verticals ────────────────────────────────────────────────────
+        add(self.addLine(left_x,  _TOP_Y, left_x,  _TOP_Y + _H, gp))
         add(self.addLine(right_x, _TOP_Y, right_x, _TOP_Y + _H, gp))
 
         # ── PORT terminal ─────────────────────────────────────────────────────
-        # Circle on top-left corner
         px, py = left_x, _TOP_Y
-        add(self.addEllipse(px-6, py-6, 12, 12, tp,
-                            QBrush(Qt.BrushStyle.NoBrush)))
+        add(self.addEllipse(px - 6, py - 6, 12, 12, tp, QBrush(_nb())))
         lbl = self.addText("PORT", QFont("Consolas", 9))
         lbl.setDefaultTextColor(_qc("#3fb950"))
         lbl.setPos(px - 40, py - 22)
@@ -851,38 +867,42 @@ class SchematicScene(QGraphicsScene):
 
         # ── OUT terminal ──────────────────────────────────────────────────────
         ox, oy = right_x, _TOP_Y
-        add(self.addEllipse(ox-6, oy-6, 12, 12, tp,
-                            QBrush(Qt.BrushStyle.NoBrush)))
+        add(self.addEllipse(ox - 6, oy - 6, 12, 12, tp, QBrush(_nb())))
         olbl = self.addText("OUT", QFont("Consolas", 9))
         olbl.setDefaultTextColor(_qc("#3fb950"))
         olbl.setPos(ox + 10, oy - 22)
         add(olbl)
 
-        # ── Ground symbol (below bottom-right corner) ─────────────────────────
-        gx = right_x
-        gy = _TOP_Y + _H
+        # ── Ground symbol ─────────────────────────────────────────────────────
+        gx, gy = right_x, _TOP_Y + _H
         for i, hw in enumerate([14, 10, 6]):
             yi = gy + 6 + i * 6
             add(self.addLine(gx - hw, yi, gx + hw, yi, gp))
 
-        # ── Node dots where each component meets the top rail ─────────────────
-        dot_pen  = QPen(_qc(_SIG_C), 1)
-        dot_brush = QBrush(_qc(_SIG_C))
+        # ── Node dots on top rail at each shunt tap ───────────────────────────
+        dot_p = QPen(_qc(_NODE_C), 1)
+        dot_b = QBrush(_qc(_NODE_C))
         for comp in self._components:
-            cx = comp.x()
-            add(self.addEllipse(cx-5, _TOP_Y-5, 10, 10, dot_pen, dot_brush))
+            if comp.mode == "shunt":
+                cx = comp.x()
+                add(self.addEllipse(cx - 5, _TOP_Y - 5, 10, 10, dot_p, dot_b))
 
-        # ── Node dots on bottom rail ───────────────────────────────────────────
-        dot_gpen  = QPen(_qc(_GND_C), 1)
-        dot_gbrush = QBrush(_qc(_GND_C))
+        # ── Node dots on bottom rail ──────────────────────────────────────────
+        gdot_p = QPen(_qc(_GND_C), 1)
+        gdot_b = QBrush(_qc(_GND_C))
         for comp in self._components:
             cx = comp.x()
-            add(self.addEllipse(cx-5, _TOP_Y+_H-5, 10, 10,
-                                dot_gpen, dot_gbrush))
+            add(self.addEllipse(cx - 5, _TOP_Y + _H - 5, 10, 10,
+                                gdot_p, gdot_b))
 
     def get_config(self):
+        """
+        Build network_engine config list.
+        Shunt elements are treated as the terminal load unless a downstream
+        component follows.  For hackathon-level use, shunt R/L/C elements
+        are mapped to single-element network_engine loads.
+        """
         return [c.to_config_dict() for c in self._components]
-
 
 
 class _ValueDialog(QWidget):
@@ -976,10 +996,12 @@ class _ValueDialog(QWidget):
 
 # ── Schematic editor widget (canvas + palette toolbar) ────────────────────────
 
+
 class SchematicEditorWidget(QWidget):
     """
-    The full editor: palette buttons on top, schematic canvas below.
-    Lives in the "Network" tab of the sidebar tab widget.
+    Palette bar:  [⇒R] [⇒L] [⇒C]  |  [↓R] [↓L] [↓C]  |  [RLC]  |  [✕Del] [↺Clear]
+    ⇒ = series (inline on signal rail)
+    ↓ = shunt  (drops to ground)
     """
 
     def __init__(self, parent=None):
@@ -991,24 +1013,63 @@ class SchematicEditorWidget(QWidget):
         # ── Palette bar ───────────────────────────────────────────────────────
         palette = QWidget()
         palette.setFixedHeight(30)
-        palette.setStyleSheet(f"background:{BG0};border-bottom:1px solid {BORD2};")
+        palette.setStyleSheet(
+            f"background:{BG0};border-bottom:1px solid {BORD2};")
         pal_lay = QHBoxLayout(palette)
         pal_lay.setContentsMargins(6, 3, 6, 3)
-        pal_lay.setSpacing(4)
+        pal_lay.setSpacing(3)
 
         self._scene = SchematicScene()
 
-        for label, ctype in [
-            ("＋R", "R"), ("＋L", "L"), ("＋C", "C"), ("＋RLC", "RLC"),
-        ]:
+        # Series buttons (blue accent)
+        series_style = (
+            f"font-size:9px;padding:0 5px;"
+            f"background:{BG2};border:1px solid {C_BLUE};"
+            f"color:{C_BLUE};font-family:{MONO};border-radius:2px;")
+        for label, ctype in [("⇒R", "R"), ("⇒L", "L"), ("⇒C", "C")]:
             btn = QPushButton(label)
             btn.setFixedHeight(22)
-            btn.setStyleSheet(
-                f"font-size:9px;padding:0 6px;"
-                f"background:{BG2};border:1px solid {BORD2};"
-                f"color:{TEXT2};font-family:{MONO};border-radius:2px;")
-            btn.clicked.connect(lambda _, t=ctype: self._scene.add_component(t))
+            btn.setStyleSheet(series_style)
+            btn.setToolTip(f"Add series {ctype} (inline on signal path)")
+            btn.clicked.connect(
+                lambda _, t=ctype: self._scene.add_component(t, mode="series"))
             pal_lay.addWidget(btn)
+
+        # Separator
+        sep1 = QLabel("|")
+        sep1.setStyleSheet(f"color:{TEXT3};background:transparent;")
+        pal_lay.addWidget(sep1)
+
+        # Shunt buttons (grey accent)
+        shunt_style = (
+            f"font-size:9px;padding:0 5px;"
+            f"background:{BG2};border:1px solid {BORD2};"
+            f"color:{TEXT2};font-family:{MONO};border-radius:2px;")
+        for label, ctype in [("↓R", "R"), ("↓L", "L"), ("↓C", "C")]:
+            btn = QPushButton(label)
+            btn.setFixedHeight(22)
+            btn.setStyleSheet(shunt_style)
+            btn.setToolTip(f"Add shunt {ctype} (drops to ground)")
+            btn.clicked.connect(
+                lambda _, t=ctype: self._scene.add_component(t, mode="shunt"))
+            pal_lay.addWidget(btn)
+
+        # Separator
+        sep2 = QLabel("|")
+        sep2.setStyleSheet(f"color:{TEXT3};background:transparent;")
+        pal_lay.addWidget(sep2)
+
+        # RLC compound button (amber accent)
+        rlc_btn = QPushButton("＋RLC")
+        rlc_btn.setFixedHeight(22)
+        rlc_btn.setStyleSheet(
+            f"font-size:9px;padding:0 5px;"
+            f"background:{BG2};border:1px solid #d29922;"
+            f"color:#d29922;font-family:{MONO};border-radius:2px;")
+        rlc_btn.setToolTip("Add RLC ladder (series-L, shunt-C, series-R)")
+        rlc_btn.clicked.connect(
+            lambda: self._scene.add_component("RLC", mode="rlc"))
+        pal_lay.addWidget(rlc_btn)
 
         pal_lay.addSpacing(8)
 
@@ -1029,10 +1090,9 @@ class SchematicEditorWidget(QWidget):
             f"color:{TEXT3};font-family:{MONO};border-radius:2px;")
         clr_btn.clicked.connect(self._scene.clear_all)
         pal_lay.addWidget(clr_btn)
-        pal_lay.addStretch()
 
-        # Hint label
-        hint = QLabel("double-click to edit · drag to reorder")
+        pal_lay.addStretch()
+        hint = QLabel("⇒=series  ↓=shunt  · dbl-click to edit · drag to reorder")
         hint.setStyleSheet(
             f"color:{TEXT3};font-size:8px;background:transparent;"
             f"font-family:{MONO};")
@@ -1043,18 +1103,18 @@ class SchematicEditorWidget(QWidget):
         # ── Canvas ────────────────────────────────────────────────────────────
         self._view = QGraphicsView(self._scene)
         self._view.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self._view.setStyleSheet(
-            f"background:{BG1};border:none;")
+        self._view.setStyleSheet(f"background:{BG1};border:none;")
         self._view.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._view.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._view.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._view.setAlignment(
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         outer.addWidget(self._view)
 
-        # ── Z0 row ────────────────────────────────────────────────────────────
+        # ── Z₀ row ────────────────────────────────────────────────────────────
         z0_bar = QWidget()
         z0_bar.setFixedHeight(28)
         z0_bar.setStyleSheet(
@@ -1079,7 +1139,7 @@ class SchematicEditorWidget(QWidget):
         outer.addWidget(z0_bar)
 
         # Seed with default RLC load
-        self._scene.add_component("RLC")
+        self._scene.add_component("RLC", mode="rlc")
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -1102,10 +1162,12 @@ class SchematicEditorWidget(QWidget):
                 last.update()
                 self._scene.config_changed.emit()
             else:
-                # Add a fresh RLC at the end
-                self._scene.add_component("RLC", {"R": R, "L": L, "C": C})
+                self._scene.add_component(
+                    "RLC", mode="rlc", values={"R": R, "L": L, "C": C})
         else:
-            self._scene.add_component("RLC", {"R": R, "L": L, "C": C})
+            self._scene.add_component(
+                "RLC", mode="rlc", values={"R": R, "L": L, "C": C})
+
 
 # ─── Background worker ─────────────────────────────────────────────────────────
 
