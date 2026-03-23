@@ -323,9 +323,12 @@ def _sfg_terminate(cascaded: Optional["skrf.Network"],
         denom_sfg = np.where(np.abs(denom_sfg) < _EPS, _EPS + 0j, denom_sfg)
         gamma_in  = S11 + (S12 * gamma_L * S21) / denom_sfg
 
-    # Recover input impedance from Γ_in
+# Recover input impedance from Γ_in
+    # Use a larger epsilon here — 1e-6 prevents noise when |Γ|→1 (far from
+    # resonance) where floating-point cancellation in (1 - Γ) causes wild
+    # swings in Re(Z). This only affects display; S11/VSWR/phase are unaffected.
     denom_z = 1.0 - gamma_in
-    denom_z = np.where(np.abs(denom_z) < _EPS, _EPS + 0j, denom_z)
+    denom_z = np.where(np.abs(denom_z) < 1e-6, 1e-6 + 0j, denom_z)
     Z_in    = Z0 * (1.0 + gamma_in) / denom_z
 
     return gamma_in, Z_in

@@ -333,147 +333,224 @@ class ReadoutCard(QWidget):
 
 # ─── Schematic Editor ──────────────────────────────────────────────────────────
 #
-# Textbook two-rail schematic.
+# ANSI/IEEE standard schematic symbols, pixel-perfect geometry.
 #
-# Geometry:
+# Symbol standard: ANSI throughout (zigzag R, coil L, parallel-plate C).
 #
-#   PORT ○──────┬──────┬──────┬──────○ OUT
-#               │      │      │
-#              [L]    [C]    [R]          ← vertical shunt elements
-#               │      │      │
-#   GND  ───────┴──────┴──────┴──────
+# Key geometry insight for coil arcs (QPainter.arcTo):
+#   arcTo(QRectF(x, y_wire-a, bw, 2*a), 180, -180)
+#     → CW semicircle; entry=(x, y_wire), exit=(x+bw, y_wire), peak=(x+bw/2, y_wire-a)
+#   This is the ONLY rect placement that puts both endpoints exactly on the wire.
 #
-#   R, L, C  → drawn as vertical shunt elements between rails
-#   RLC      → L in series on top rail, shunt C, R in series — proper ladder
+# For the shunt (vertical) inductor we rotate the painter 90° CW so the
+# horizontal bump formula applies unchanged, then restore the transform.
 #
-# Each component item is positioned at its column X, vertically spanning
-# exactly from RAIL_TOP to RAIL_BOT.  The top rail and bottom rail are
-# static background lines drawn by the scene.
+# Layout:
+#   Two horizontal rails separated by _H px.
+#   R, L, C  → shunt columns, _PITCH wide.
+#   RLC      → ladder section, _RLC_W wide:
+#              PORT──[L series]──●──[R series]──OUT
+#                                │
+#                               [C shunt]
+#                                │
+#                               GND
 
-# ── Geometry ─────────────────────────────────────────────────────────────────
-_TOP_Y    = -80     # Y of top (signal) rail in scene coords
-_BOT_Y    =  80     # Y of bottom (ground) rail in scene coords
-_H        = _BOT_Y - _TOP_Y          # 160 px  — vertical span
-_PITCH    = 120     # horizontal pitch between component columns
-_PORT_X   =  80     # X of left port terminal
-_SIG_C    = "#58a6ff"   # signal rail / component colour (blue)
-_GND_C    = "#8b949e"   # ground rail colour (grey)
-_LOAD_C   = "#d29922"   # amber for the terminal load
-_LBL_C    = "#8b949e"   # value/type label colour
+# ── Grid & geometry constants ─────────────────────────────────────────────────
+_TOP_Y   = -110    # Y coordinate of signal (top) rail  (scene space)
+_BOT_Y   =  110    # Y coordinate of ground (bottom) rail
+_H       = _BOT_Y - _TOP_Y          # 220 px  — vertical span
 
-def _qc(h): return QColor(h)
-def _wp(c, w=2.0): return QPen(_qc(c), w)
+_PITCH   = 150     # horizontal column width for a single R / L / C
+_RLC_W   = 420     # horizontal width of a full RLC ladder block
+
+_PORT_X  =  60     # X of left port circle
+
+# ── Colour palette ────────────────────────────────────────────────────────────
+_SIG_C   = "#58a6ff"   # blue  — signal rail, components
+_GND_C   = "#6e7681"   # grey  — ground rail
+_LOAD_C  = "#d29922"   # amber — terminal load
+_LBL_C   = "#a6adc8"   # dim label text
+
+# ── Pen / colour helpers ──────────────────────────────────────────────────────
+def _qc(h):
+    return QColor(h)
+
+def _wp(col, w=2.0):
+    """Round-cap, round-join solid pen — essential for clean arc joins."""
+    p = QPen(_qc(col), w)
+    p.setCapStyle(Qt.PenCapStyle.RoundCap)
+    p.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    return p
+
+def _nb():
+    """No brush."""
+    return Qt.BrushStyle.NoBrush
 
 
-# ── Helper drawing functions (pure, no class state) ──────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# PRIMITIVE SYMBOL FUNCTIONS
+# All functions draw in LOCAL component coordinates:
+#   top rail  = y=0
+#   bot rail  = y=_H
+#   component centre = x=0
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def _draw_inductor_series(painter, x0, x1, y):
+# ── Resistor ──────────────────────────────────────────────────────────────────
+
+def _sym_resistor_h(painter, x0, x1, y, col):
     """
-    Series inductor: draw coil bumps inline on a horizontal wire at height y.
-    x0..x1 = full width allocated (including stubs).
+    ANSI zigzag resistor on a horizontal wire.
+    6 peaks, amplitude ±10 px.  Wire stubs on both sides.
     """
-    coil_w = (x1 - x0) * 0.60
-    cx     = (x0 + x1) / 2
-    n_b    = 4
-    bw     = coil_w / n_b
-    lx     = cx - coil_w / 2
-    # stub in
-    painter.drawLine(QPointF(x0, y), QPointF(lx, y))
+    n_peaks = 6
+    amp     = 10
+    body_w  = (x1 - x0) * 0.55
+    cx      = (x0 + x1) * 0.5
+    bx      = cx - body_w * 0.5   # body left x
+    seg     = body_w / n_peaks
+
+    painter.setPen(_wp(col, 2.2))
+    painter.setBrush(_nb())
+    painter.drawLine(QPointF(x0, y), QPointF(bx, y))
+
     path = QPainterPath()
-    path.moveTo(lx, y)
-    for i in range(n_b):
-        path.arcTo(QRectF(lx + i*bw, y - bw, bw, bw), 0, 180)
+    path.moveTo(bx, y)
+    for i in range(n_peaks):
+        path.lineTo(bx + (i + 0.5) * seg, y - amp if i % 2 == 0 else y + amp)
+        path.lineTo(bx + (i + 1.0) * seg, y)
     painter.drawPath(path)
-    # stub out
-    painter.drawLine(QPointF(lx + coil_w, y), QPointF(x1, y))
+    painter.drawLine(QPointF(bx + body_w, y), QPointF(x1, y))
 
 
-def _draw_resistor_series(painter, x0, x1, y):
-    """Series resistor zigzag inline on a horizontal wire at height y."""
-    zw   = (x1 - x0) * 0.55
-    cx   = (x0 + x1) / 2
-    n, a = 7, 8
-    seg  = zw / n
-    lx   = cx - zw / 2
-    painter.drawLine(QPointF(x0, y), QPointF(lx, y))
+def _sym_resistor_v(painter, cx, top_y, bot_y, col):
+    """
+    IEC rectangle for a VERTICAL (shunt) resistor.
+    Rectangle centred on the wire, stubs top & bottom.
+    """
+    span = bot_y - top_y
+    bh   = span * 0.40
+    bw   = 24
+    mcy  = (top_y + bot_y) * 0.5
+
+    painter.setPen(_wp(col, 2.2))
+    painter.setBrush(_nb())
+    painter.drawLine(QPointF(cx, top_y), QPointF(cx, mcy - bh * 0.5))
+    painter.drawRect(QRectF(cx - bw * 0.5, mcy - bh * 0.5, bw, bh))
+    painter.drawLine(QPointF(cx, mcy + bh * 0.5), QPointF(cx, bot_y))
+
+
+# ── Inductor ──────────────────────────────────────────────────────────────────
+
+def _sym_inductor_h(painter, x0, x1, y, col):
+    """
+    ANSI coil — 4 semicircular bumps ABOVE the wire.
+
+    Geometry (proven correct):
+      Each bump i: arcTo(QRectF(bx+i*bw, y-a, bw, 2*a), 180, -180)
+        entry = left-midpoint  = (bx+i*bw,     y)   ← exactly on wire
+        exit  = right-midpoint = (bx+(i+1)*bw, y)   ← exactly on wire
+        peak  = top-centre     = (bx+(i+0.5)*bw, y-a)
+    No gaps, no overlaps with the wire.
+    """
+    N   = 4          # number of bumps
+    a   = 14         # half-height of arc rect  → bump protrudes 'a' px above wire
+    bw  = (x1 - x0) * 0.58 / N   # width of each bump
+    bx  = (x0 + x1) * 0.5 - N * bw * 0.5   # left edge of first bump
+
+    painter.setPen(_wp(col, 2.2))
+    painter.setBrush(_nb())
+
+    # Left stub
+    painter.drawLine(QPointF(x0, y), QPointF(bx, y))
+
     path = QPainterPath()
-    path.moveTo(lx, y)
-    for i in range(n):
-        path.lineTo(lx + (i+0.5)*seg, y - a if i%2==0 else y + a)
-        path.lineTo(lx + (i+1)*seg,   y)
+    path.moveTo(bx, y)
+    for i in range(N):
+        path.arcTo(QRectF(bx + i * bw, y - a, bw, 2 * a), 180, -180)
+
     painter.drawPath(path)
-    painter.drawLine(QPointF(lx + zw, y), QPointF(x1, y))
+    # Right stub
+    painter.drawLine(QPointF(bx + N * bw, y), QPointF(x1, y))
 
 
-def _draw_capacitor_shunt(painter, cx, top_y, bot_y, sig_col, gnd_col):
+def _sym_inductor_v(painter, cx, top_y, bot_y, col):
     """
-    Shunt capacitor: two horizontal plates between top and bottom rails.
-    cx = column centre x.
+    ANSI coil — 4 bumps LEFT of the vertical wire.
+
+    Strategy: rotate the painter 90° CW around the wire midpoint so that
+    the vertical wire becomes horizontal, draw _sym_inductor_h, restore.
+    This reuses the proven-correct horizontal geometry exactly.
+
+    After 90° CW rotation:
+      The wire runs left→right at y=0 in rotated space.
+      'top_y' in original space → x-direction in rotated space.
     """
-    mid  = (top_y + bot_y) / 2
-    gap  = 10
-    pw   = 34   # plate width
-    # Wire from top rail down to top plate
-    painter.setPen(_wp(sig_col))
-    painter.drawLine(QPointF(cx, top_y), QPointF(cx, mid - gap/2))
-    # Top plate
-    painter.drawLine(QPointF(cx - pw/2, mid - gap/2),
-                     QPointF(cx + pw/2, mid - gap/2))
-    # Bottom plate
-    painter.drawLine(QPointF(cx - pw/2, mid + gap/2),
-                     QPointF(cx + pw/2, mid + gap/2))
-    # Wire from bottom plate to bottom rail
-    painter.setPen(_wp(gnd_col))
-    painter.drawLine(QPointF(cx, mid + gap/2), QPointF(cx, bot_y))
+    span = bot_y - top_y
+    mid_y = (top_y + bot_y) * 0.5
+
+    painter.save()
+    # Translate to midpoint of wire, rotate 90° CW
+    painter.translate(cx, mid_y)
+    painter.rotate(90)
+    # Now the wire runs horizontally from -span/2 to +span/2 at y=0
+    # Draw bumps 'above' this rotated wire = to the LEFT in original space ✓
+    _sym_inductor_h(painter, -span * 0.5, span * 0.5, 0, col)
+    painter.restore()
 
 
-def _draw_inductor_shunt(painter, cx, top_y, bot_y, col):
+# ── Capacitor ─────────────────────────────────────────────────────────────────
+
+def _sym_capacitor_v(painter, cx, top_y, bot_y, sig_col, gnd_col):
     """
-    Shunt inductor: vertical coil between rails.
+    Two parallel plates, vertical (shunt).
+    Upper plate = signal colour; lower plate = ground colour.
+    Gap = 12 px; plate width = 44 px.
     """
-    h    = bot_y - top_y
-    n_b  = 4
-    bh   = h * 0.55 / n_b
-    cy0  = top_y + (h - n_b * bh) / 2
-    painter.setPen(_wp(col))
-    painter.drawLine(QPointF(cx, top_y), QPointF(cx, cy0))
-    path = QPainterPath()
-    path.moveTo(cx, cy0)
-    for i in range(n_b):
-        ty = cy0 + i * bh
-        path.arcTo(QRectF(cx - bh/2, ty, bh, bh), 90, 180)
-    painter.drawPath(path)
-    yl = cy0 + n_b * bh
-    painter.drawLine(QPointF(cx, yl), QPointF(cx, bot_y))
+    mid = (top_y + bot_y) * 0.5
+    gap = 12
+    pw  = 44
+
+    # Signal half
+    painter.setPen(_wp(sig_col, 2.2))
+    painter.setBrush(_nb())
+    painter.drawLine(QPointF(cx, top_y), QPointF(cx, mid - gap * 0.5))
+    painter.drawLine(QPointF(cx - pw * 0.5, mid - gap * 0.5),
+                     QPointF(cx + pw * 0.5, mid - gap * 0.5))
+
+    # Ground half
+    painter.setPen(_wp(gnd_col, 2.2))
+    painter.drawLine(QPointF(cx - pw * 0.5, mid + gap * 0.5),
+                     QPointF(cx + pw * 0.5, mid + gap * 0.5))
+    painter.drawLine(QPointF(cx, mid + gap * 0.5), QPointF(cx, bot_y))
 
 
-def _draw_resistor_shunt(painter, cx, top_y, bot_y, col):
-    """
-    Shunt resistor: IEC rectangle between rails.
-    """
-    h   = bot_y - top_y
-    bh  = h * 0.44
-    bw  = 20
-    mcy = (top_y + bot_y) / 2
-    painter.setPen(_wp(col))
-    painter.drawLine(QPointF(cx, top_y), QPointF(cx, mcy - bh/2))
-    painter.drawRect(QRectF(cx - bw/2, mcy - bh/2, bw, bh))
-    painter.drawLine(QPointF(cx, mcy + bh/2), QPointF(cx, bot_y))
+# ── Junction dot ──────────────────────────────────────────────────────────────
+
+def _sym_dot(painter, x, y, col, r=5.0):
+    """Filled T-junction dot."""
+    painter.setPen(QPen(_qc(col), 1))
+    painter.setBrush(QBrush(_qc(col)))
+    painter.drawEllipse(QPointF(x, y), r, r)
+    painter.setBrush(_nb())
 
 
-# ── Component item ────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMPONENT ITEM
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class SchematicComponent(QGraphicsItem):
     """
-    One component column.  Item origin is at (column_x, _TOP_Y).
-    The item spans vertically from 0 (top rail) to _H (bottom rail).
+    One component column.
+    Item origin is placed at (column_centre_x, _TOP_Y) by the scene.
 
-    Component drawing rules:
-      R   → shunt resistor (IEC rectangle, vertical)
-      L   → shunt inductor (vertical coil)
-      C   → shunt capacitor (two horizontal plates)
-      RLC → series L on top rail + shunt C + series R on top rail
-            (the classic pi/T ladder section for a series-RLC antenna)
+    Local coordinate space:
+      y = 0    → top rail
+      y = _H   → bottom rail
+      x = 0    → column centre
+
+    Width:
+      R / L / C → _PITCH
+      RLC       → _RLC_W
     """
 
     def __init__(self, comp_type, values, scene_ref, parent=None):
@@ -484,88 +561,109 @@ class SchematicComponent(QGraphicsItem):
         self._is_load   = False
         self._hovered   = False
         self.setFlags(
-            QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
-            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+            QGraphicsItem.GraphicsItemFlag.ItemIsMovable      |
+            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable   |
             QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges,
         )
         self.setAcceptHoverEvents(True)
 
+    # ── Geometry ──────────────────────────────────────────────────────────────
+
+    def _half_w(self):
+        return (_RLC_W // 2) if self.comp_type == "RLC" else (_PITCH // 2)
+
     def boundingRect(self):
-        # Extra vertical space for labels above and below
-        return QRectF(-_PITCH/2, -28, _PITCH, _H + 56)
+        hw = self._half_w()
+        return QRectF(-hw, -36, hw * 2, _H + 72)
+
+    # ── Painting ──────────────────────────────────────────────────────────────
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(_nb())
 
         is_load = self._is_load
         hover   = self._hovered or self.isSelected()
-        sig_c   = _LOAD_C if is_load else (_SIG_C if not hover else "#89c4ff")
+        sig_c   = _LOAD_C if is_load else (_SIG_C if not hover else "#a8d4ff")
         gnd_c   = _GND_C
+        t       = self.comp_type
 
-        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if   t == "R":   _sym_resistor_v (painter, 0, 0, _H, sig_c)
+        elif t == "L":   _sym_inductor_v (painter, 0, 0, _H, sig_c)
+        elif t == "C":   _sym_capacitor_v(painter, 0, 0, _H, sig_c, gnd_c)
+        elif t == "RLC": self._paint_rlc (painter, sig_c, gnd_c)
 
-        t = self.comp_type
-
-        if t == "R":
-            _draw_resistor_shunt(painter, 0, 0, _H, sig_c)
-        elif t == "L":
-            _draw_inductor_shunt(painter, 0, 0, _H, sig_c)
-        elif t == "C":
-            _draw_capacitor_shunt(painter, 0, 0, _H, sig_c, gnd_c)
-        elif t == "RLC":
-            self._paint_rlc_series(painter, sig_c, gnd_c)
-
-        # ── Value label — above the top rail ─────────────────────────────────
+        # ── Value label (above top rail) ──────────────────────────────────────
+        hw = self._half_w()
         painter.setPen(QPen(_qc(sig_c if is_load else _LBL_C), 1))
         painter.setFont(QFont("Consolas", 8))
         painter.drawText(
-            QRectF(-_PITCH/2, -26, _PITCH, 14),
+            QRectF(-hw, -34, hw * 2, 20),
             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
             self._value_str(),
         )
 
-        # ── Type label — below the bottom rail ───────────────────────────────
+        # ── Type label (below bottom rail) ────────────────────────────────────
         painter.setPen(QPen(_qc(sig_c), 1))
         painter.setFont(QFont("Consolas", 7))
         painter.drawText(
-            QRectF(-_PITCH/2, _H + 6, _PITCH, 14),
+            QRectF(-hw, _H + 8, hw * 2, 16),
             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-            self.comp_type + (" [LOAD]" if is_load else ""),
+            t + (" [LOAD]" if is_load else ""),
         )
 
-    def _paint_rlc_series(self, painter, sig_c, gnd_c):
+    def _paint_rlc(self, painter, sig_c, gnd_c):
         """
-        Textbook series-RLC section drawn in one column:
+        Ladder section — textbook layout:
 
-          ├──coil──●──zigzag──┤   (top rail, series L then series R)
-                   │
-                  [C]              (shunt C from the node between L and R)
-                   │
-          ├────────────────────┤   (bottom rail)
+          x_left         x_mid           x_right
+            |              |               |
+        ────╗═══[L]═══╗────●────╗═══[R]═══╗────
+                           │
+                          [C]
+                           │
+        ────────────────────────────────────────
 
-        The junction node is at x=0 (column centre), y=0 (top rail).
+        Spacing: L occupies left 38%, junction at centre, R occupies right 38%.
+        4% guard on each end for wire stubs.
         """
-        # ── Series L (left half of top rail) ─────────────────────────────────
-        painter.setPen(_wp(sig_c))
-        _draw_inductor_series(painter, -_PITCH/2, -8, 0)
+        hw       = _RLC_W // 2
+        x_l      = -hw           # left edge
+        x_r      =  hw           # right edge
+        # Dividers — leave 10% stub on each end, split remaining 80% as L|gap|R
+        stub     = hw * 0.08
+        body     = hw * 0.82     # half of total body (one side)
+        x_lend   = -body * 0.10  # inductor ends just left of centre
+        x_rstart =  body * 0.10  # resistor starts just right of centre
+        x_mid    = 0             # junction node
 
-        # ── Junction dot ─────────────────────────────────────────────────────
-        painter.setBrush(QBrush(_qc(sig_c)))
-        painter.setPen(QPen(_qc(sig_c), 1))
-        painter.drawEllipse(QPointF(0, 0), 4, 4)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
+        # Series L (left stub → x_lend)
+        _sym_inductor_h(painter, x_l, x_lend, 0, sig_c)
 
-        # ── Shunt C (vertical, from junction down to bottom rail) ─────────────
-        _draw_capacitor_shunt(painter, 0, 0, _H, sig_c, gnd_c)
+        # Wire stub: x_lend → junction
+        painter.setPen(_wp(sig_c, 2.2))
+        painter.drawLine(QPointF(x_lend, 0), QPointF(x_mid, 0))
 
-        # ── Series R (right half of top rail) ────────────────────────────────
-        painter.setPen(_wp(sig_c))
-        _draw_resistor_series(painter, 8, _PITCH/2, 0)
+        # Junction dot
+        _sym_dot(painter, x_mid, 0, sig_c)
+
+        # Shunt C (from junction down to bottom rail)
+        _sym_capacitor_v(painter, x_mid, 0, _H, sig_c, gnd_c)
+
+        # Wire stub: junction → x_rstart
+        painter.setPen(_wp(sig_c, 2.2))
+        painter.drawLine(QPointF(x_mid, 0), QPointF(x_rstart, 0))
+
+        # Series R (x_rstart → right edge)
+        _sym_resistor_h(painter, x_rstart, x_r, 0, sig_c)
+
+    # ── Value string ──────────────────────────────────────────────────────────
 
     def _value_str(self):
         t, v = self.comp_type, self.values
         def _f(val, u, s, d=1): return f"{val/s:.{d}f} {u}"
-        if t == "R":  return _f(v.get("R", 0), "Ω",   1,    1)
+        if t == "R":
+            return _f(v.get("R", 0), "Ω", 1, 1)
         if t == "L":
             l = v.get("L", 0)
             return _f(l, "nH", 1e-9, 1) if l < 1e-6 else _f(l, "µH", 1e-6, 2)
@@ -573,10 +671,9 @@ class SchematicComponent(QGraphicsItem):
             c = v.get("C", 0)
             return _f(c, "pF", 1e-12, 1) if c < 1e-9 else _f(c, "nF", 1e-9, 2)
         if t == "RLC":
-            v2 = self.values
-            return (f"L={v2.get('L',0)*1e9:.0f}nH  "
-                    f"C={v2.get('C',0)*1e12:.0f}pF  "
-                    f"R={v2.get('R',0):.0f}Ω")
+            return (f"L={v.get('L',0)*1e9:.0f}nH  "
+                    f"C={v.get('C',0)*1e12:.0f}pF  "
+                    f"R={v.get('R',0):.0f}Ω")
         return ""
 
     # ── Interaction ───────────────────────────────────────────────────────────
@@ -593,24 +690,22 @@ class SchematicComponent(QGraphicsItem):
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
-            return QPointF(value.x(), _TOP_Y)   # lock to top rail
+            return QPointF(value.x(), _TOP_Y)
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             self._scene_ref.on_component_moved()
         return super().itemChange(change, value)
 
     def to_config_dict(self):
         t, v = self.comp_type, self.values
-        if t == "R":   return {"type":"R",   "value": float(v.get("R",50))}
-        if t == "L":   return {"type":"L",   "value": float(v.get("L",1e-6))}
-        if t == "C":   return {"type":"C",   "value": float(v.get("C",1e-9))}
-        if t == "RLC": return {"type":"RLC",
-                               "R": float(v.get("R",50)),
-                               "L": float(v.get("L",1e-6)),
-                               "C": float(v.get("C",1e-9))}
+        if t == "R":   return {"type": "R",   "value": float(v.get("R",  50.0))}
+        if t == "L":   return {"type": "L",   "value": float(v.get("L",  1e-6))}
+        if t == "C":   return {"type": "C",   "value": float(v.get("C",  1e-9))}
+        if t == "RLC": return {"type": "RLC",
+                               "R": float(v.get("R",  50.0)),
+                               "L": float(v.get("L",  1e-6)),
+                               "C": float(v.get("C",  1e-9))}
         return {}
 
-
-# ── Scene ─────────────────────────────────────────────────────────────────────
 
 class SchematicScene(QGraphicsScene):
     config_changed = pyqtSignal()
@@ -666,10 +761,16 @@ class SchematicScene(QGraphicsScene):
         self.config_changed.emit()
 
     def _layout(self):
-        x = _PORT_X + _PITCH / 2
+        if not self._components:
+            self._redraw_static()
+            return
+        first_hw = (_RLC_W // 2) if self._components[0].comp_type == "RLC" else (_PITCH // 2)
+        x = _PORT_X + first_hw
         for comp in self._components:
             comp.setPos(x, _TOP_Y)
-            x += _PITCH
+            hw = (_RLC_W // 2) if comp.comp_type == "RLC" else (_PITCH // 2)
+            next_hw = hw  # same for gap between components
+            x += hw + next_hw
         self._redraw_static()
         self._mark_load()
 
@@ -698,8 +799,10 @@ class SchematicScene(QGraphicsScene):
 
         first_x = self._components[0].x()
         last_x  = self._components[-1].x()
-        left_x  = first_x - _PITCH / 2
-        right_x = last_x  + _PITCH / 2
+        first_hw = _RLC_W // 2 if self._components[0].comp_type == "RLC" else _PITCH // 2
+        last_hw  = _RLC_W // 2 if self._components[-1].comp_type == "RLC" else _PITCH // 2
+        left_x  = first_x - first_hw
+        right_x = last_x  + last_hw
 
         sp = QPen(_qc(_SIG_C), 2.2)
         gp = QPen(_qc(_GND_C), 2.2)
@@ -709,8 +812,23 @@ class SchematicScene(QGraphicsScene):
             self._static.append(item)
             return item
 
-        # ── Top rail ──────────────────────────────────────────────────────────
-        add(self.addLine(left_x, _TOP_Y, right_x, _TOP_Y, sp))
+        # ── Top rail — draw in segments, leaving gaps where RLC series elements sit ──
+        # For RLC components the series L and R sit ON the top rail wire, so the
+        # static rail must stop at the component's left edge and resume at its
+        # right edge.  The component's paint() draws the L and R inline instead.
+        # For R/L/C shunt components the rail runs straight through (just a dot).
+        seg_starts = [left_x]
+        seg_ends   = []
+        for comp in self._components:
+            cx  = comp.x()
+            if comp.comp_type == "RLC":
+                hw = _RLC_W // 2
+                seg_ends.append(cx - hw)
+                seg_starts.append(cx + hw)
+        seg_ends.append(right_x)
+        for xs, xe in zip(seg_starts, seg_ends):
+            if xe > xs:
+                add(self.addLine(xs, _TOP_Y, xe, _TOP_Y, sp))
 
         # ── Bottom rail ───────────────────────────────────────────────────────
         add(self.addLine(left_x, _TOP_Y + _H, right_x, _TOP_Y + _H, gp))
@@ -1795,8 +1913,10 @@ class MainWindow(QMainWindow):
         rl  = result["return_loss"][idx]
 
         f_str = _fmt_freq(bw["f_res"])
-        if rc:
-            f_str += f"  Δ={rc['deviation_pct']:.3f}%"
+        dev = rc.get("deviation_pct", float("nan"))
+        import math
+        if rc and not math.isnan(dev):
+            f_str += f"  Δ={dev:.3f}%"
         self._card_res.set("f0",        f_str)
         self._card_res.set("S11 min",   f"{bw['s11_min']:.3f} dB")
         self._card_res.set("VSWR",      self._fmt_vswr(result["vswr"][idx]))

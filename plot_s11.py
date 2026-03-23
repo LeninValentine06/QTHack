@@ -223,7 +223,12 @@ class VNACanvas(FigureCanvas):
         if mode == "Log Mag (dB)":       return result["s11_db"],          "S11 (dB)",        col
         if mode == "Linear Mag":          return np.abs(result["gamma"]),   "|Γ|",             col
         if mode == "VSWR":                return np.minimum(result["vswr"], 50.0), "VSWR",            col
-        if mode == "Phase (deg)":         return result["phase_deg"],        "Phase (°)",       col
+        if mode == "Phase (deg)":
+            # Insert NaN at wrap boundaries so matplotlib draws a gap instead of
+            # a vertical line jumping ±360° across the wrap point.
+            ph = result["phase_deg"].copy().astype(float)
+            ph[np.abs(np.diff(ph, prepend=ph[0])) > 180.0] = np.nan
+            return ph, "Phase (°)", col
         if mode == "Unwrapped Phase":     return result["phase_unwrapped"],  "Phase (°)",       col
         if mode == "Group Delay (ns)":    return result["group_delay_ns"],   "Group Delay (ns)",col
         if mode == "Real Z (Ω)":          return result["z_real"],           "Re(Z) (Ω)",       col
@@ -274,8 +279,15 @@ class VNACanvas(FigureCanvas):
         if ylim is not None:
             ax.set_ylim(*ylim)
         else:
-            ymin, ymax = y.min(), y.max()
-            pad = (ymax - ymin) * 0.12 or 1.0
+            ymin, ymax = float(y.min()), float(y.max())
+            span = ymax - ymin
+            if span < 1e-6:
+                # Flat signal (e.g. Re(Z)=73 Ω constant) — pad by 20% of the
+                # value magnitude so the axis isn't a ±1 Ω window that makes
+                # sub-pixel rendering noise look like huge oscillations.
+                pad = max(abs(ymax) * 0.20, 1.0)
+            else:
+                pad = span * 0.12
             ax.set_ylim(ymin - pad, ymax + pad)
 
         # Reference lines
