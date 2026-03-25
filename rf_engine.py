@@ -332,6 +332,7 @@ def run_simulation(f_start: float, f_stop: float, n_points: int,
         # ── Core physics arrays ───────────────────────────────────────────
         frequencies     = freqs,
         Z_L             = Z_L,
+        Z_load_bare     = Z_L,   # rf_engine has no cascade: bare load = Z_L
         gamma           = gamma,
         s11_db          = s11,
         vswr            = vswr,

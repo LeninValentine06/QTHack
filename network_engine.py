@@ -140,6 +140,33 @@ def _series_2port(freq_obj: "skrf.Frequency",
     return skrf.Network(frequency=freq_obj, s=s)
 
 
+def _shunt_2port(freq_obj: "skrf.Frequency",
+                 Z_shunt: np.ndarray,
+                 Z0: float) -> "skrf.Network":
+    """
+    Shunt-impedance 2-port.  ABCD = [[1, 0], [Y, 1]] where Y = 1/Z_shunt.
+
+    S-parameters (Z0-normalised, Pozar §4.4):
+        S11 = S22 = -Z0 / (2·Z_shunt + Z0)
+        S12 = S21 = 2·Z_shunt / (2·Z_shunt + Z0)
+
+    Edge cases:
+        Z_shunt → ∞ (open): S11→0, S12→1  (transparent, no shunt path)
+        Z_shunt → 0 (short): S11→-1, S12→0 (total reflection, port 2 shorted)
+    """
+    n = len(freq_obj)
+    s = np.zeros((n, 2, 2), dtype=complex)
+    # Guard against Z_shunt = 0 (dead short)
+    Z_safe = np.where(np.abs(Z_shunt) < _EPS, _EPS + 0j, Z_shunt)
+    denom = 2.0 * Z_safe + Z0
+    denom = np.where(np.abs(denom) < _EPS, _EPS + 0j, denom)
+    s[:, 0, 0] = -Z0 / denom
+    s[:, 1, 1] = s[:, 0, 0]
+    s[:, 0, 1] = 2.0 * Z_safe / denom
+    s[:, 1, 0] = s[:, 0, 1]
+    return skrf.Network(frequency=freq_obj, s=s)
+
+
 def _tl_2port(freq_obj: "skrf.Frequency",
               tl_Z0: float,
               Z_ref: float,
@@ -203,16 +230,39 @@ def _tl_2port(freq_obj: "skrf.Frequency",
 def _build_inline_2port(comp: Dict[str, Any],
                         freq_obj: "skrf.Frequency",
                         Z0: float) -> "skrf.Network":
-    """Return a 2-port Network for one in-line component."""
+    """
+    Return a 2-port Network for one in-line component.
+
+    Shunt detection: checks both ``_shunt`` (matching_engine convention,
+    bool) and ``_mode`` (gui.py/schematic convention, str "shunt"|"series").
+    Either flag causes the element to be modelled as a shunt-to-ground 2-port.
+    """
     t = comp["type"].upper()
 
+    # Unified shunt detection: _shunt (bool) OR _mode=="shunt" (str)
+    is_shunt = (comp.get("_shunt", False) is True or
+                comp.get("_mode", "series") == "shunt")
+
+    # Build the impedance array for this component
+    # Series/matching elements (L, C) use a lossy model with finite Q so that
+    # ideal cancellation is impossible and S11 stays physically realistic.
+    # Q values: Q_L=50 (typical RF inductor), Q_C=200 (C0G/NP0 ceramic cap).
+    # The Q factors can be overridden per-component via "Q_L" / "Q_C" keys.
     if t == "R":
-        return _series_2port(freq_obj, _z_resistor(freq_obj.f, comp["value"]), Z0)
+        Z = _z_resistor(freq_obj.f, comp["value"])
     elif t == "L":
-        return _series_2port(freq_obj, _z_inductor(freq_obj.f, comp["value"]), Z0)
+        omega = 2.0 * np.pi * freq_obj.f
+        v     = comp["value"]
+        Q_L   = float(comp.get("Q_L", 50.0))
+        Z     = 1j * omega * v + omega * v / Q_L     # jωL + ESR
     elif t == "C":
-        return _series_2port(freq_obj, _z_capacitor(freq_obj.f, comp["value"]), Z0)
+        omega = 2.0 * np.pi * freq_obj.f
+        omega_s = np.where(np.abs(omega) < _EPS, _EPS, omega)
+        v     = comp["value"]
+        Q_C   = float(comp.get("Q_C", 200.0))
+        Z     = 1.0 / (1j * omega_s * v) + 1.0 / (omega_s * v * Q_C)  # 1/jωC + ESR
     elif t == "RLC":
+        # RLC is always a series element (the full antenna equivalent circuit)
         return _series_2port(
             freq_obj,
             _z_rlc(freq_obj.f, comp.get("R", 0.0),
@@ -220,25 +270,31 @@ def _build_inline_2port(comp: Dict[str, Any],
             Z0,
         )
     elif t == "TL":
+        # Transmission lines are always series (in-line)
         return _tl_2port(
             freq_obj,
-            tl_Z0    = comp.get("Z0", Z0),
-            Z_ref    = Z0,
-            length   = comp.get("length", None),
-            vf       = comp.get("vf", 1.0),
-            el_deg   = comp.get("el_deg", None),
-            el_ref_hz= comp.get("el_ref_hz", None),
+            tl_Z0     = comp.get("Z0", Z0),
+            Z_ref     = Z0,
+            length    = comp.get("length", None),
+            vf        = comp.get("vf", 1.0),
+            el_deg    = comp.get("el_deg", None),
+            el_ref_hz = comp.get("el_ref_hz", None),
         )
     elif t == "Z":
         Z = np.asarray(comp["value"], dtype=complex)
         if Z.ndim == 0:
             Z = np.full(len(freq_obj), Z)
-        return _series_2port(freq_obj, Z, Z0)
     else:
         raise ValueError(
             f"Unknown component type '{comp['type']}'. "
             f"Supported in-line types: R, L, C, RLC, TL, Z"
         )
+
+    # Dispatch: series or shunt 2-port
+    if is_shunt:
+        return _shunt_2port(freq_obj, Z, Z0)
+    else:
+        return _series_2port(freq_obj, Z, Z0)
 
 
 def _load_impedance(comp: Dict[str, Any],
@@ -322,6 +378,19 @@ def _sfg_terminate(cascaded: Optional["skrf.Network"],
         denom_sfg = 1.0 - S22 * gamma_L
         denom_sfg = np.where(np.abs(denom_sfg) < _EPS, _EPS + 0j, denom_sfg)
         gamma_in  = S11 + (S12 * gamma_L * S21) / denom_sfg
+
+    # Physical realism clamp: |Γ| < 1e-3 (−60 dB) is unreachable with real
+    # RF components due to parasitics, tolerance, and loss. Clamping prevents
+    # the ideal-math singularity (S11 → −∞) without altering any physically
+    # meaningful result above −60 dB.
+    _GAMMA_FLOOR = 1e-3
+    gamma_mag = np.abs(gamma_in)
+    too_small = gamma_mag < _GAMMA_FLOOR
+    if np.any(too_small):
+        safe_mag = np.where(gamma_mag < _EPS, _EPS, gamma_mag)
+        gamma_in = np.where(too_small,
+                            gamma_in * (_GAMMA_FLOOR / safe_mag),
+                            gamma_in)
 
 # Recover input impedance from Γ_in
     # Fix #9: use 1e-9 instead of 1e-6. The old 1e-6 guard clamped Z_in
@@ -451,7 +520,8 @@ def _pack_result(freqs: np.ndarray,
                  Z_in:  np.ndarray,
                  Z0:    float,
                  mode:  str,
-                 n_comp: int) -> dict:
+                 n_comp: int,
+                 Z_load: np.ndarray = None) -> dict:
     """
     Build the result dict that gui.py, plot_s11.py, smith_chart.py consume.
     Key names are the contract defined in rf_engine.run_simulation().
@@ -499,6 +569,12 @@ def _pack_result(freqs: np.ndarray,
         mode             = mode,
         n_components     = n_comp,
         has_skrf         = HAS_SKRF,
+
+        # ── Bare terminal load impedance (used by matching widget) ─────────
+        # Z_load_bare = impedance of the terminal element ONLY, before any
+        # in-line matching network is applied.  Z_L = Z_in includes all
+        # cascaded elements; Z_load_bare is the antenna/load by itself.
+        Z_load_bare      = Z_load if Z_load is not None else Z_in,
     )
 
 
@@ -541,12 +617,53 @@ def compute_network_response(
     if n == 0:
         gamma = np.ones(len(freq_array), dtype=complex)  # Γ = +1 (open)
         Z_in  = np.full(len(freq_array), 1e9 + 0j)       # 1 GΩ proxy
-        return _pack_result(freq_array, gamma, Z_in, Z0, "skrf", 0)
+        return _pack_result(freq_array, gamma, Z_in, Z0, "skrf", 0,
+                            Z_load=Z_in)
+
+    # ── Topology validation: last non-shunt element must be RLC ──────────────
+    # Find the last non-shunt element (the terminal load).
+    _last_load_idx = None
+    for _idx in range(n - 1, -1, -1):
+        _c = network_config[_idx]
+        _is_shunt = (_c.get("_shunt", False) is True or
+                     _c.get("_mode", "series") == "shunt")
+        if not _is_shunt:
+            _last_load_idx = _idx
+            break
+
+    if _last_load_idx is not None:
+        _load_type = str(network_config[_last_load_idx].get("type", "")).upper()
+        if _load_type != "RLC":
+            raise ValueError(
+                f"TOPOLOGY ERROR: The terminal (last non-shunt) element must be "
+                f"type 'RLC', but found type '{_load_type}' at index {_last_load_idx}.\n"
+                f"The RLC block encodes the antenna impedance Z(f) = R + j(ωL − 1/ωC) "
+                f"as a single atomic load.\n"
+                f"Do NOT decompose it into separate R, L, C elements — this changes the "
+                f"topology from series to ladder, producing physically incorrect S11."
+            )
+    # Ensure no RLC element exists as an in-line 2-port (i.e., before the terminal)
+    for _idx, _c in enumerate(network_config):
+        if _idx == _last_load_idx:
+            continue
+        if str(_c.get("type", "")).upper() == "RLC":
+            _is_shunt = (_c.get("_shunt", False) is True or
+                         _c.get("_mode", "series") == "shunt")
+            if not _is_shunt:
+                raise ValueError(
+                    f"TOPOLOGY ERROR: RLC element at index {_idx} is not the terminal "
+                    f"load — only one RLC (the last non-shunt element) is allowed. "
+                    f"All in-line matching elements must be individual R, L, or C "
+                    f"components placed BEFORE the terminal RLC."
+                )
 
     # ── Manual mode ───────────────────────────────────────────────────────────
     if mode == "manual":
         gamma, Z_in = _manual_response(network_config, freq_array, Z0)
-        return _pack_result(freq_array, gamma, Z_in, Z0, "manual", n)
+        # In manual mode all elements are series-summed; last element is the load
+        Z_load_bare = _load_impedance(network_config[-1], freq_array, Z0)
+        return _pack_result(freq_array, gamma, Z_in, Z0, "manual", n,
+                            Z_load=Z_load_bare)
 
     # ── skrf mode ─────────────────────────────────────────────────────────────
     if not HAS_SKRF:
@@ -559,18 +676,59 @@ def compute_network_response(
     freq_obj = _make_freq_obj(freq_array)
 
     if n == 1:
-        # Single element: it is the load, no in-line cascade
-        Z_load = _load_impedance(network_config[0], freq_array, Z0)
-        gamma, Z_in = _sfg_terminate(None, Z_load, Z0)
+        comp = network_config[0]
+        is_shunt = (comp.get("_shunt", False) is True or
+                    comp.get("_mode", "series") == "shunt")
+        if is_shunt:
+            # A lone shunt element: build it as a 2-port into an open load
+            net = _build_inline_2port(comp, freq_obj, Z0)
+            # Open-circuit load (Γ_L = +1)
+            Z_load = np.full(len(freq_array), 1e9 + 0j)
+            gamma, Z_in = _sfg_terminate(net, Z_load, Z0)
+        else:
+            Z_load = _load_impedance(comp, freq_array, Z0)
+            gamma, Z_in = _sfg_terminate(None, Z_load, Z0)
     else:
-        # All but last are in-line 2-ports; last is the load
-        inline_nets = [_build_inline_2port(c, freq_obj, Z0)
-                       for c in network_config[:-1]]
-        cascade = _cascade(inline_nets)
-        Z_load  = _load_impedance(network_config[-1], freq_array, Z0)
-        gamma, Z_in = _sfg_terminate(cascade, Z_load, Z0)
+        # Find the terminal load: the last element that is NOT a shunt.
+        # All shunt elements (even if last in the list) are in-line 2-ports.
+        load_idx = None
+        for idx in range(n - 1, -1, -1):
+            c = network_config[idx]
+            is_shunt = (c.get("_shunt", False) is True or
+                        c.get("_mode", "series") == "shunt")
+            if not is_shunt:
+                load_idx = idx
+                break
 
-    return _pack_result(freq_array, gamma, Z_in, Z0, "skrf", n)
+        if load_idx is None:
+            # All shunt — stack them as 2-ports, open terminal load
+            inline_nets = [_build_inline_2port(c, freq_obj, Z0)
+                           for c in network_config]
+            cascade = _cascade(inline_nets)
+            Z_load = np.full(len(freq_array), 1e9 + 0j)
+            gamma, Z_in = _sfg_terminate(cascade, Z_load, Z0)
+        else:
+            # In-line 2-ports: everything except the terminal load
+            inline_comps = [c for i, c in enumerate(network_config)
+                            if i != load_idx]
+            inline_nets = [_build_inline_2port(c, freq_obj, Z0)
+                           for c in inline_comps]
+            cascade = _cascade(inline_nets) if inline_nets else None
+            Z_load = _load_impedance(network_config[load_idx], freq_array, Z0)
+            gamma, Z_in = _sfg_terminate(cascade, Z_load, Z0)
+
+    # ── Z_load_bare: the antenna/terminal element impedance alone ─────────────
+    Z_load_bare = Z_load   # default: whatever terminal load was computed above
+    for comp in reversed(network_config):
+        if comp.get("type", "").upper() == "RLC":
+            Z_load_bare = _z_rlc(freq_array,
+                                  comp.get("R", 0.0),
+                                  comp.get("L", 1e-30),
+                                  comp.get("C", 1e-30))
+            break
+
+    return _pack_result(freq_array, gamma, Z_in, Z0, "skrf", n,
+                        Z_load=Z_load_bare)
 
 
 # =============================================================================

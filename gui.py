@@ -340,14 +340,23 @@ class ReadoutCard(QWidget):
 # ───────────────
 #   "series"  → drawn inline on the top rail (R, L, C)
 #   "shunt"   → drawn vertically from the rail to ground (R, L, C)
-#   "rlc"     → compound ladder block (series-L → shunt-C → series-R)
+#   "rlc"     → ATOMIC terminal load — single series-RLC impedance block
+#               Z(f) = R + j(ωL − 1/ωC)
+#               NOT a ladder. NOT decomposed into separate R/L/C nodes.
 #
 # RF backend mapping (network_engine.py)
 # ──────────────────────────────────────
 #   series element → {"type":"R"|"L"|"C", "value":...}   2-port cascade
-#   shunt element  → {"type":"R"|"L"|"C", "value":...}   treated as load branch
-#                    (shunt-only networks still work as before)
-#   rlc block      → {"type":"RLC", R, L, C}              last element = load
+#   shunt element  → {"type":"R"|"L"|"C", "value":..., "_shunt":True}
+#   rlc block      → {"type":"RLC", R, L, C}              ALWAYS last = terminal load
+#
+# TOPOLOGY RULE (enforced by network_engine.compute_network_response)
+# ────────────────────────────────────────────────────────────────────
+#   The LAST non-shunt element MUST be the RLC block.
+#   Matching network elements (L, C series/shunt) go BEFORE it.
+#   The solver uses: Γ_in = S11 + (S12·Γ_L·S21)/(1−S22·Γ_L)
+#   where Γ_L = (Z_RLC − Z₀)/(Z_RLC + Z₀) and Z_RLC is the full
+#   series impedance, not a decomposed ladder.
 #
 # Layout engine
 # ─────────────
@@ -625,27 +634,50 @@ class SchematicComponent(QGraphicsItem):
 
     def _paint_rlc(self, painter, sig_c, gnd_c):
         """
-        Compound ladder:  ──[L]──●──[R]──
-                                  │
-                                 [C]
-                                  │
-                                 GND
-        """
-        hw      = _RLC_W // 2
-        x_l     = -hw
-        x_r     =  hw
-        x_mid   =  0
-        x_lend  = -hw * 0.22
-        x_rstart =  hw * 0.22
+        Atomic series-RLC terminal load block.
 
-        _sym_L_series(painter, x_l, x_lend, 0, sig_c)
+        Drawn as a single bordered rectangle spanning the full rail width,
+        with the label "Z = R + j(ωL − 1/ωC)" inside.  This makes it
+        visually clear that this is ONE indivisible impedance element, NOT
+        a ladder of separate R, L, C components.
+
+        The physics engine (rf_engine / network_engine) treats it as:
+            Z(f) = R + j(2πf·L − 1/(2πf·C))
+        which is the standard series-RLC antenna equivalent circuit.
+        """
+        hw   = _RLC_W // 2
+        x_l  = -hw
+        x_r  =  hw
+        box_h = 60
+
+        # ── Lead wires from rails to box edges ────────────────────────────────
         painter.setPen(_wp(sig_c, 2.2))
-        painter.drawLine(QPointF(x_lend, 0), QPointF(x_mid, 0))
-        _sym_dot(painter, x_mid, 0, sig_c)
-        _sym_C_shunt(painter, x_mid, 0, _H, sig_c, gnd_c)
-        painter.setPen(_wp(sig_c, 2.2))
-        painter.drawLine(QPointF(x_mid, 0), QPointF(x_rstart, 0))
-        _sym_R_series(painter, x_rstart, x_r, 0, sig_c)
+        painter.drawLine(QPointF(x_l, 0),       QPointF(x_l + 24, 0))
+        painter.drawLine(QPointF(x_r - 24, 0),  QPointF(x_r,       0))
+
+        # ── Outer bounding box (load block) ───────────────────────────────────
+        box_rect = QRectF(x_l + 24, -box_h / 2, _RLC_W - 48, box_h)
+        painter.setPen(_wp(sig_c, 2.0))
+        painter.setBrush(QBrush(QColor("#141c2a")))   # dark fill
+        painter.drawRoundedRect(box_rect, 4, 4)
+        painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+
+        # ── Three sub-element labels inside the box (R, L, C inline) ─────────
+        # Instead of separate symbols, show schematic shorthand text so there
+        # is zero ambiguity that these are IN SERIES, not a ladder.
+        painter.setPen(QPen(QColor(sig_c), 1))
+        painter.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        painter.drawText(
+            box_rect,
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignCenter,
+            "── R ── L ── C ──\n(series, atomic load)"
+        )
+
+        # ── Ground rail connection (centre bottom of box to GND rail) ─────────
+        cx = 0.0
+        box_bot = box_h / 2
+        painter.setPen(_wp(gnd_c, 1.6))
+        painter.drawLine(QPointF(cx, box_bot), QPointF(cx, _H))
 
     # ── Value string ──────────────────────────────────────────────────────────
 
@@ -688,15 +720,16 @@ class SchematicComponent(QGraphicsItem):
     def to_config_dict(self):
         """Map to network_engine format."""
         t, v, m = self.comp_type, self.values, self.mode
+        is_shunt = (m == "shunt")
         if t == "R":
             return {"type": "R", "value": float(v.get("R", 50.0)),
-                    "_mode": m}
+                    "_shunt": is_shunt, "_mode": m}
         if t == "L":
             return {"type": "L", "value": float(v.get("L", 1e-6)),
-                    "_mode": m}
+                    "_shunt": is_shunt, "_mode": m}
         if t == "C":
             return {"type": "C", "value": float(v.get("C", 1e-9)),
-                    "_mode": m}
+                    "_shunt": is_shunt, "_mode": m}
         if t == "RLC":
             return {"type": "RLC",
                     "R": float(v.get("R", 50.0)),
@@ -721,6 +754,10 @@ class SchematicScene(QGraphicsScene):
         """
         mode = "series" | "shunt"
         RLC is always its own compound type (mode ignored).
+
+        TOPOLOGY RULE: the RLC block must ALWAYS be the last element.
+        If an RLC is already present and a new component is added,
+        the new component is inserted BEFORE the existing RLC.
         """
         defs = {
             "R":   {"R": 50.0},
@@ -735,7 +772,21 @@ class SchematicScene(QGraphicsScene):
             self,
         )
         self.addItem(comp)
-        self._components.append(comp)
+
+        if comp_type != "RLC":
+            # Find the last RLC in the list; insert the new component before it
+            rlc_idx = None
+            for i, c in enumerate(self._components):
+                if c.comp_type == "RLC":
+                    rlc_idx = i
+            if rlc_idx is not None:
+                self._components.insert(rlc_idx, comp)
+            else:
+                self._components.append(comp)
+        else:
+            # RLC always goes to the end
+            self._components.append(comp)
+
         self._layout()
         self.config_changed.emit()
 
@@ -895,14 +946,33 @@ class SchematicScene(QGraphicsScene):
             add(self.addEllipse(cx - 5, _TOP_Y + _H - 5, 10, 10,
                                 gdot_p, gdot_b))
 
-    def get_config(self):
+    def get_config(self) -> list:
         """
         Build network_engine config list.
-        Shunt elements are treated as the terminal load unless a downstream
-        component follows.  For hackathon-level use, shunt R/L/C elements
-        are mapped to single-element network_engine loads.
+
+        TOPOLOGY RULE (enforced here + in network_engine):
+        - The last non-shunt element MUST be type RLC.
+        - If no RLC exists, a default half-wave dipole RLC is appended
+          so the network always has a physically meaningful terminal load.
+        - Shunt elements (↓R/↓L/↓C) are correctly flagged with _shunt=True
+          and are handled as 2-port shunt branches by the cascade solver.
         """
-        return [c.to_config_dict() for c in self._components]
+        configs = [c.to_config_dict() for c in self._components]
+
+        # Guard: ensure the last non-shunt element is RLC
+        last_load_idx = None
+        for i in range(len(configs) - 1, -1, -1):
+            c = configs[i]
+            if not c.get("_shunt", False):
+                last_load_idx = i
+                break
+
+        if last_load_idx is None or configs[last_load_idx].get("type", "").upper() != "RLC":
+            # Auto-repair: append default dipole RLC so the solver never sees
+            # a non-RLC terminal load from the GUI path
+            configs.append({"type": "RLC", "R": 73.0, "L": 35e-9, "C": 7e-12})
+
+        return configs
 
 
 class _ValueDialog(QWidget):
@@ -1066,7 +1136,11 @@ class SchematicEditorWidget(QWidget):
             f"font-size:9px;padding:0 5px;"
             f"background:{BG2};border:1px solid #d29922;"
             f"color:#d29922;font-family:{MONO};border-radius:2px;")
-        rlc_btn.setToolTip("Add RLC ladder (series-L, shunt-C, series-R)")
+        rlc_btn.setToolTip(
+            "Add RLC terminal load — atomic series impedance Z(f) = R + j(ωL − 1/ωC).\n"
+            "This is always the LAST element (the antenna). It is NOT decomposed into\n"
+            "separate R, L, C ladder components — doing so changes the topology."
+        )
         rlc_btn.clicked.connect(
             lambda: self._scene.add_component("RLC", mode="rlc"))
         pal_lay.addWidget(rlc_btn)
@@ -1196,6 +1270,7 @@ class SimWorker(QThread):
                 result["sweep_type"]       = sweep
                 result["if_bw_hz"]         = p.get("if_bw", 1000.0)
                 result["output_power_dbm"] = p.get("output_power_dbm", -10.0)
+                result["network_config"]   = config   # needed by matching widget
                 self.finished.emit(result)
             else:
                 self.finished.emit(run_simulation(**p_fwd))
@@ -1219,6 +1294,12 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self.setStyleSheet(DARK)
         self._connect_signals()
+        # Apply the first non-Custom preset on startup so sweep range is correct
+        first_preset = next(
+            (k for k in PRESETS if PRESETS[k] is not None), None)
+        if first_preset:
+            self.preset_combo.setCurrentText(first_preset)
+            self._on_preset(first_preset)
         self.statusBar().showMessage(
             "READY  ·  configure sweep parameters and press ▶ START SWEEP")
 
@@ -1315,6 +1396,13 @@ class MainWindow(QMainWindow):
         net_lay.addWidget(self.schematic_editor)
         self._main_tabs.addTab(net_widget, "Network Editor")
 
+        # ── Tab 3: Impedance Matching ─────────────────────────────────────────
+        from matching_widget import MatchingWidget
+        self.matching_widget = MatchingWidget()
+        self.matching_widget.network_updated.connect(
+            self._on_matching_network_updated)
+        self._main_tabs.addTab(self.matching_widget, "⚡ Impedance Matching")
+
         rv.addWidget(self._main_tabs, stretch=1)
         rv.addWidget(self._build_marker_status_bar())
         rv.addWidget(self._build_marker_table_widget())
@@ -1397,6 +1485,7 @@ class MainWindow(QMainWindow):
 
         self.inp_sweep_type = QComboBox()
         self.inp_sweep_type.addItems(["Logarithmic", "Linear"])
+        self.inp_sweep_type.setCurrentIndex(0)   # default: log sweep
 
         def rl(t):
             lb = QLabel(t)
@@ -1854,11 +1943,33 @@ class MainWindow(QMainWindow):
         # Feed both canvases and Smith; secondary uses its own mode
         self.main_canvas.plot_result(result)
         self.secondary_canvas.plot_result(result)
-        self.smith_canvas.plot_result(result)
+        # Pass R/L/C for Smith chart annotation
+        try:
+            R = float(self.inp_R.text())
+            L = self.inp_L.si_value()
+            C = self.inp_C.si_value()
+        except (ValueError, AttributeError):
+            R = L = C = None
+        self.smith_canvas.plot_result(result, R=R, L=L, C=C)
 
         self._update_readout(result)
         self._update_marker_table()
         self._update_status_bar()
+
+        # Feed result to matching widget so "Load Z_L from VNA" works.
+        # Also pass the sidebar R/L/C as a direct fallback for RLC params —
+        # these are always available even when network_config has no RLC element.
+        if hasattr(self, "matching_widget"):
+            try:
+                rlc_R = float(self.inp_R.text())
+                rlc_L = self.inp_L.si_value()
+                rlc_C = self.inp_C.si_value()
+            except (ValueError, AttributeError):
+                rlc_R = rlc_L = rlc_C = None
+            self.matching_widget.load_from_vna(result,
+                                               rlc_R=rlc_R,
+                                               rlc_L=rlc_L,
+                                               rlc_C=rlc_C)
 
         bw = result["bandwidth"]
         rc = result.get("resonance_check", {})
@@ -1883,6 +1994,85 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         QMessageBox.critical(self, "Simulation Error", msg)
         self.statusBar().showMessage("Error: " + msg)
+
+    def _on_matching_network_updated(self, components: list):
+        """
+        Called when the Matching tab emits network_updated.
+
+        Inserts the computed L/C matching elements into the schematic
+        BEFORE the existing terminal load, then switches to the Network
+        Editor tab so the user can see the result.
+
+        Only previously-applied matching elements (tagged _is_matching=True)
+        are removed on re-apply.  The user's original schematic components
+        (R, L, C shunts, RLC, TL, etc.) are NEVER touched.
+
+        Series elements (_shunt=False) → mode="series"
+        Shunt elements  (_shunt=True)  → mode="shunt"
+        """
+        if not components:
+            return
+
+        scene = self.schematic_editor._scene
+
+        # ── Step 1: remove only previously-applied matching elements ──────────
+        # These are tagged with _is_matching=True when inserted below.
+        to_remove = [c for c in scene._components
+                     if getattr(c, "_is_matching", False)]
+        for c in to_remove:
+            if c in scene._components:
+                scene._components.remove(c)
+            scene.removeItem(c)
+
+        # ── Step 2: find the terminal load (last component in the chain) ──────
+        # The load is whatever component is currently last — it may be an RLC,
+        # a plain C, R, L, or a transmission line.  We insert matching elements
+        # immediately before it so the topology becomes:
+        #   PORT ── [match elems] ── [original load] ── OUT
+        terminal_comp = scene._components[-1] if scene._components else None
+
+        if terminal_comp is None:
+            # Empty schematic: create a default half-wave dipole RLC as load
+            terminal_comp = SchematicComponent(
+                "RLC", "rlc", {"R": 73.0, "L": 35e-9, "C": 7e-12}, scene)
+            terminal_comp._is_matching = False
+            scene.addItem(terminal_comp)
+            scene._components.append(terminal_comp)
+
+        # ── Step 3: insert matching elements before the terminal load ─────────
+        for comp_dict in components:
+            t     = comp_dict["type"].upper()
+            val   = float(comp_dict["value"])
+            shunt = comp_dict.get("_shunt", False)
+            mode  = "shunt" if shunt else "series"
+            # Build a properly-keyed values dict (only the relevant key is set)
+            if t == "R":
+                values = {"R": val}
+            elif t == "L":
+                values = {"L": val}
+            elif t == "C":
+                values = {"C": val}
+            else:
+                values = {"R": val}
+
+            new_comp = SchematicComponent(t, mode, values, scene)
+            new_comp._is_matching = True   # tag so re-apply can remove cleanly
+            scene.addItem(new_comp)
+
+            term_idx = scene._components.index(terminal_comp)
+            scene._components.insert(term_idx, new_comp)
+
+        scene._layout()
+        scene._mark_load()
+        scene.config_changed.emit()
+
+        n = len(components)
+        self.statusBar().showMessage(
+            f"✓ Matching network applied — {n} element(s) inserted before load. "
+            f"Topology: PORT ── {'── '.join(c['type'] for c in components)} ── [LOAD]. "
+            f"Switch to VNA Plots and run a sweep to verify."
+        )
+        self._main_tabs.setCurrentIndex(1)
 
     def _on_main_click(self, event):
         if self._result is None or event.xdata is None:
