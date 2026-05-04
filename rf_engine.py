@@ -362,3 +362,143 @@ def run_simulation(f_start: float, f_stop: float, n_points: int,
             message       = warn_msg,
         ),
     )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 7 — Quantum / high-Q extensions
+# (Added for quantum_gui_tab.py and quantum_network.py; no changes above.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_q_factor(freqs: np.ndarray, s11_db: np.ndarray,
+                     threshold_db: float = -3.0) -> "float | None":
+    """
+    Q factor from the bandwidth at ``threshold_db`` relative to resonance.
+
+        Q = f_res / bandwidth
+
+    Uses the same log-frequency interpolation as _compute_bandwidth(), but
+    the threshold is applied relative to the S11 floor (not absolute), so
+    it correctly handles both under-coupled and over-coupled resonators.
+
+    Parameters
+    ----------
+    freqs        : frequency array in Hz
+    s11_db       : S11 in dB
+    threshold_db : level in dB below the resonance floor (default −3 dB)
+                   Pass a negative value, e.g. −3.0 or −10.0.
+
+    Returns
+    -------
+    Loaded Q (float) or None if resonance / bandwidth not found.
+    """
+    res_idx = int(np.argmin(s11_db))
+    s11_min = float(s11_db[res_idx])
+    f_res   = float(freqs[res_idx])
+
+    # Absolute crossing level
+    abs_thr = s11_min + abs(threshold_db)
+
+    if s11_min > abs_thr:
+        return None
+
+    # Walk left for f_low
+    f_low = None
+    for i in range(res_idx, -1, -1):
+        if s11_db[i] >= abs_thr:
+            if i + 1 <= res_idx:
+                t = ((abs_thr - s11_db[i])
+                     / (s11_db[i+1] - s11_db[i] + _EPS))
+                f_low = np.exp(
+                    np.log(max(freqs[i], _EPS))
+                    + t * (np.log(max(freqs[i+1], _EPS))
+                           - np.log(max(freqs[i], _EPS))))
+            else:
+                f_low = float(freqs[i])
+            break
+
+    # Walk right for f_high
+    f_high = None
+    for i in range(res_idx, len(freqs)):
+        if s11_db[i] >= abs_thr:
+            if i > 0:
+                t = ((abs_thr - s11_db[i-1])
+                     / (s11_db[i] - s11_db[i-1] + _EPS))
+                f_high = np.exp(
+                    np.log(max(freqs[i-1], _EPS))
+                    + t * (np.log(max(freqs[i], _EPS))
+                           - np.log(max(freqs[i-1], _EPS))))
+            else:
+                f_high = float(freqs[i])
+            break
+
+    if f_low is None or f_high is None:
+        return None
+    bw = float(f_high - f_low)
+    if bw <= _EPS:
+        return None
+    return float(f_res / bw)
+
+
+def compute_t1_estimate(q_loaded: float, f_res_hz: float) -> float:
+    """
+    Estimate T₁ relaxation time from loaded Q and resonance frequency.
+
+        T₁ [µs] = Q_loaded / (π · f_res_hz) × 10⁶
+
+    Parameters
+    ----------
+    q_loaded   : loaded quality factor (dimensionless)
+    f_res_hz   : resonance frequency in Hz
+
+    Returns
+    -------
+    T₁ estimate in **microseconds**.
+    """
+    f_res_hz = max(abs(f_res_hz), _EPS)
+    q_loaded  = max(q_loaded,      _EPS)
+    return float(q_loaded / (np.pi * f_res_hz) * 1e6)
+
+
+def compute_dispersive_shift(f_qubit_hz: float, f_readout_hz: float,
+                              g_hz: float) -> float:
+    """
+    Dispersive approximation for the qubit–readout coupling shift χ.
+
+    Simple two-level approximation (infinite anharmonicity limit):
+
+        χ [MHz] = g² / (f_readout − f_qubit)  ×  10⁻⁶
+
+    For the full transmon correction with finite anharmonicity α, use
+    quantum_network.compute_dispersive_shift(f_q, f_r, g, alpha).
+
+    Parameters
+    ----------
+    f_qubit_hz   : qubit frequency in Hz
+    f_readout_hz : readout resonator frequency in Hz
+    g_hz         : coupling strength in Hz
+
+    Returns
+    -------
+    χ in **MHz** (negative when f_qubit < f_readout, as is typical).
+    """
+    delta = f_readout_hz - f_qubit_hz
+    if abs(delta) < _EPS:
+        return 0.0
+    return float(g_hz**2 / delta / 1e6)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# __main__ — extended to cover quantum functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("rf_engine quantum extension self-test")
+    f = np.logspace(np.log10(4.5e9), np.log10(5.5e9), 1000)
+    f0 = 5.0e9; bw_target = 5e6
+    # Synthetic Lorentzian S11 dip
+    s11 = -30.0 / (1.0 + ((f - f0) / (bw_target/2))**2)
+    Q = compute_q_factor(f, s11, threshold_db=-3.0)
+    print(f"  compute_q_factor: Q={Q:.1f}  (expected ~{f0/bw_target:.0f})")
+    t1 = compute_t1_estimate(1e6, 5e9)
+    print(f"  compute_t1_estimate(1e6, 5e9): {t1:.3f} µs  (expected ~63.7 µs)")
+    chi = compute_dispersive_shift(5e9, 6.5e9, 100e6)
+    print(f"  compute_dispersive_shift(5 GHz, 6.5 GHz, 100 MHz): {chi:.4f} MHz")

@@ -1403,6 +1403,12 @@ class MainWindow(QMainWindow):
             self._on_matching_network_updated)
         self._main_tabs.addTab(self.matching_widget, "⚡ Impedance Matching")
 
+        # ── Tab 4: Quantum Systems ────────────────────────────────────────────
+        from quantum_gui_tab import QuantumTab
+        self.quantum_tab = QuantumTab()
+        self._main_tabs.addTab(self.quantum_tab, "⚛ Quantum")
+        self.quantum_tab.sweep_completed.connect(self.smith_canvas.plot_result)
+
         rv.addWidget(self._main_tabs, stretch=1)
         rv.addWidget(self._build_marker_status_bar())
         rv.addWidget(self._build_marker_table_widget())
