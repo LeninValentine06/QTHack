@@ -249,6 +249,8 @@ March 30–31, 2026 · SRMIST Kattankulathur
 Organized by the Faculty of Engineering and Technology  
 SRM Institute of Science and Technology, Kattankulathur Campus
 
+This project secured **1st Place** in **Track 03 — RF Technology & Instrumentation** and was awarded a **₹50,000 cash prize** for its RF system modelling accuracy, interactive visualization pipeline, and instrument-grade VNA simulation workflow.
+
 **Track 03 — RF Technology & Instrumentation**  
 Problem Statement #12: *VNA Reflection & VSWR Simulator*
 
