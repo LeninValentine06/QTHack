@@ -435,10 +435,10 @@ Each temperature stage has a different cable type with different propagation vel
 
 ## Team
 
-**Abishek** — ECE, SRMIST Kattankulathur  
+**Abishek Raja A** — ECE, SRMIST Kattankulathur  
 **Lenin Valentine C J** — ECE, SRMIST Kattankulathur  
-**Abinesh** — ECE, SRMIST Kattankulathur  
-**Vishal** — ECE, SRMIST Kattankulathur  
+**Abinesh S** — ECE, SRMIST Kattankulathur  
+**Vishal R** — ECE, SRMIST Kattankulathur  
 
 Supervised by **Dr. Sivakumar E**, Assistant Professor, ECE Department, SRMIST
 
