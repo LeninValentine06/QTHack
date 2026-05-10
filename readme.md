@@ -6,6 +6,9 @@ SRMIST Kattankulathur · March 30–31, 2026
 
 ---
 
+Contributed to as part of the QtHack04 team project.
+Additional modifications and enhancements maintained in this fork.
+
 ## Overview
 
 A desktop Vector Network Analyzer (VNA) simulator that models impedance mismatch, computes reflection physics, and visualizes the results in a professional instrument-grade interface. The simulator covers the full measurement chain — from a cascaded RF network definition through to S11, VSWR, phase, group delay, and Smith chart display — and extends into superconducting quantum circuit simulation with a dedicated quantum tab and cryostat attenuation chain model, all without physical hardware.
